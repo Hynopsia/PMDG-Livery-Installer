@@ -1,0 +1,6 @@
+# PyInstaller / Nuitka build files
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
