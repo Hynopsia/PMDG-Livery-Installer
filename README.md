@@ -33,7 +33,7 @@ This tool aims to provide an alternative installation method for users who have 
 - **MSFS 2024 UNTESTED:** This tool has **NOT** been tested with MSFS 2024. It _might_ work if folder structures remain similar, but there is **NO GUARANTEE**.
 - **PMDG 777 ONLY:** Designed specifically for the PMDG 777-200ER, 777-300ER, and 777F. It will **NOT** work for other aircraft.
 - **ZIP SUPPORT ONLY:** Only handles `.zip` archives. It cannot process PMDG's official `.ptp` files (use the PMDG Operations Center for those).
-- **ANTIVIRUS FALSE POSITIVES:** Executables created with tools like PyInstaller or Nuitka can sometimes be flagged by antivirus software (false positive). This is often due to how the application is bundled. The source code is provided here for transparency. You can check the VirusTotal scan results for the release executable https://www.virustotal.com/gui/file/8e2e87901d5629afa546a425141a9de35557f43ddce10df6a7c5a747ae57961c?nocache=1
+- **ANTIVIRUS FALSE POSITIVES:** Executables created with tools like PyInstaller or Nuitka can sometimes be flagged by antivirus software (false positive). This is often due to how the application is bundled. The source code is provided here for transparency. You can check the VirusTotal scan results for the release executable: https://www.virustotal.com/gui/file/8e2e87901d5629afa546a425141a9de35557f43ddce10df6a7c5a747ae57961c?nocache=1
 
 ## Download
 
