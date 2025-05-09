@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*- # Specify encoding
+
 import os
 import sys
 import zipfile
@@ -10,8 +11,10 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 import webbrowser
 import subprocess # For running ptp_converter.exe
+import configparser
 from datetime import datetime
 import threading
+import tempfile
 import time
 
 # --- Helper function to find resources (for PyInstaller) ---
@@ -29,35 +32,82 @@ def get_resource_path(relative_path: str) -> str:
 # --- Constants ---
 CONFIG_DIR_NAME = ".pmdg_livery_installer"
 CONFIG_FILE_NAME = "config.json"
-DEFAULT_MIN_GAME_VERSION = "1.37.19" # Update as needed for MSFS version compatibility
+DEFAULT_MIN_GAME_VERSION = "1.37.19"
 PTP_CONVERTER_EXE_NAME = "ptp_converter.exe"
 
-# Base folder names in Community
+# Base folder names in Community for livery packages
 VARIANT_PACKAGE_MAP = {
-    "200ER": "pmdg-aircraft-77er-liveries",
-    "300ER": "pmdg-aircraft-77w-liveries",
-    "F": "pmdg-aircraft-77f-liveries"
+    # PMDG 777
+    "777-200ER": "pmdg-aircraft-77er-liveries",
+    "777-300ER": "pmdg-aircraft-77w-liveries",
+    "777F": "pmdg-aircraft-77f-liveries",
+    # PMDG 737
+    "737-600": "pmdg-aircraft-736-liveries",
+    "737-700": "pmdg-aircraft-737-liveries",
+    "737-700BBJ": "pmdg-aircraft-737-liveries",
+    "737-700BDSF": "pmdg-aircraft-737-liveries",
+    "737-800": "pmdg-aircraft-738-liveries",
+    "737-800BBJ2": "pmdg-aircraft-738-liveries",
+    "737-800BCF": "pmdg-aircraft-738-liveries",
+    "737-800BDSF": "pmdg-aircraft-738-liveries",
+    "737-900": "pmdg-aircraft-739-liveries",
+    "737-900ER": "pmdg-aircraft-739-liveries",
 }
 
-# Base aircraft folder names inside SimObjects/Airplanes (used in aircraft.cfg)
+# Base aircraft folder names inside SimObjects/Airplanes
 VARIANT_BASE_AIRCRAFT_MAP = {
-    "200ER": "PMDG 777-200ER",
-    "300ER": "PMDG 777-300ER",
-    "F": "PMDG 777F"
+    # PMDG 777
+    "777-200ER": "PMDG 777-200ER",
+    "777-300ER": "PMDG 777-300ER",
+    "777F": "PMDG 777F",
+    # PMDG 737
+    "737-600": "PMDG 737-600",
+    "737-700": "PMDG 737-700",
+    "737-700BBJ": "PMDG 737-700BBJ",
+    "737-700BDSF": "PMDG 737-700BDSF",
+    "737-800": "PMDG 737-800",
+    "737-800BBJ2": "PMDG 737-800BBJ2",
+    "737-800BCF": "PMDG 737-800BCF",
+    "737-800BDSF": "PMDG 737-800BDSF",
+    "737-900": "PMDG 737-900",
+    "737-900ER": "PMDG 737-900ER",
 }
 
-# Expected PMDG package folder names in LocalState/packages (for validation)
-EXPECTED_PMDG_PACKAGE_NAMES = {
+EXPECTED_PMDG_BASE_PACKAGE_NAMES = {
     "pmdg-aircraft-77er", "pmdg-aircraft-77w", "pmdg-aircraft-77f",
-    "pmdg-aircraft-737-600", "pmdg-aircraft-737-700",
-    "pmdg-aircraft-737-800", "pmdg-aircraft-737-900",
+    "pmdg-aircraft-736", "pmdg-aircraft-737",
+    "pmdg-aircraft-738", "pmdg-aircraft-739",
 }
 
-# Map variant code to the required base PMDG package dependency name
+# Map selected aircraft variant code to the required base PMDG package dependency name (for manifest.json)
 VARIANT_DEPENDENCY_MAP = {
-    "200ER": "pmdg-aircraft-77er",
-    "300ER": "pmdg-aircraft-77w",
-    "F": "pmdg-aircraft-77f"
+    # PMDG 777
+    "777-200ER": "pmdg-aircraft-77er",
+    "777-300ER": "pmdg-aircraft-77w",
+    "777F": "pmdg-aircraft-77f",
+
+    # PMDG 737
+    "737-600": "pmdg-aircraft-736",  
+
+    "737-700": "pmdg-aircraft-737",      
+    "737-700BBJ": "pmdg-aircraft-737",   
+    "737-700BDSF": "pmdg-aircraft-737", 
+
+    "737-800": "pmdg-aircraft-738",      
+    "737-800BBJ2": "pmdg-aircraft-738",  
+    "737-800BCF": "pmdg-aircraft-738",   
+    "737-800BDSF": "pmdg-aircraft-738", 
+
+    "737-900": "pmdg-aircraft-739",      
+    "737-900ER": "pmdg-aircraft-739",    
+}
+
+AIRCRAFT_CFG_BASE_CONTAINER_MAP = {
+    "777-200ER": "PMDG 777-200ER", "777-300ER": "PMDG 777-300ER", "777F": "PMDG 777F",
+    "737-600": "PMDG 737-600",
+    "737-700": "PMDG 737-700", "737-700BBJ": "PMDG 737-700BBJ", "737-700BDSF": "PMDG 737-700BDSF",
+    "737-800": "PMDG 737-800", "737-800BBJ2": "PMDG 737-800BBJ2", "737-800BCF": "PMDG 737-800BCF", "737-800BDSF": "PMDG 737-800BDSF",
+    "737-900": "PMDG 737-900", "737-900ER": "PMDG 737-900ER",
 }
 
 WINDOWS_TICKS = 10000000  # 10^7
@@ -73,13 +123,22 @@ def _unix_to_filetime(unix_ts) -> int:
         return int((time.time() + SEC_TO_UNIX_EPOCH) * WINDOWS_TICKS)
 
 class PMDGLiveryInstaller:
+    AIRCRAFT_HIERARCHY = {
+        "Boeing 777": ["777-200ER", "777-300ER", "777F"],
+        "Boeing 737 NG": [
+            "737-600",
+            "737-700", "737-700BBJ", "737-700BDSF",
+            "737-800", "737-800BBJ2", "737-800BCF", "737-800BDSF",
+            "737-900", "737-900ER"
+        ]
+    }
+
     def __init__(self, master: tk.Tk):
         self.master = master
-        self.app_version = "v1.10.2" # Reflects PTP logic, UI reset, and English translation
-
-        master.title(f"PMDG 777 Livery Installer {self.app_version}")
-        master.geometry("850x750") # Adjusted for slightly longer English text in some places
-        master.minsize(750, 700)
+        self.app_version = "v2.1.0" # Reflects 737 support and UI improvement
+        master.title(f"PMDG 737 & 777 Livery Installer {self.app_version}")
+        master.geometry("850x750") # Adjusted geometry
+        master.minsize(750, 650) # Adjusted min height
 
         icon_path_rel = "icon.ico"
         try:
@@ -90,24 +149,15 @@ class PMDGLiveryInstaller:
 
         self.ptp_converter_exe = get_resource_path(PTP_CONVERTER_EXE_NAME)
         if not os.path.exists(self.ptp_converter_exe):
-            print(f"CRITICAL WARNING: {PTP_CONVERTER_EXE_NAME} not found at {self.ptp_converter_exe}. "
-                  "PTP functionality will be unavailable.")
+            print(f"CRITICAL WARNING: {PTP_CONVERTER_EXE_NAME} not found. PTP functionality will be unavailable.")
             self.ptp_converter_exe = None
 
-        self.selected_zip_files: list[str] = [] # Holds paths to .zip or .ptp
+        self.selected_zip_files: list[str] = []
 
-        # UI Colors
-        self.bg_color = "#f0f0f0"
-        self.header_bg = "#1a3f5c"
-        self.header_fg = "white"
-        self.button_color = "#2c5f8a"
-        self.button_hover = "#3d7ab3"
-        self.accent_color = "#007acc"
-        self.success_color = "dark green"
-        self.warning_color = "orange"
-        self.error_color = "red"
+        self.bg_color = "#f0f0f0"; self.header_bg = "#1a3f5c"; self.header_fg = "white"
+        self.button_color = "#2c5f8a"; self.button_hover = "#3d7ab3"; self.accent_color = "#007acc"
+        self.success_color = "dark green"; self.warning_color = "orange"; self.error_color = "red"
 
-        # UI Styles
         self.style = ttk.Style()
         self.style.theme_use('clam')
         self.style.configure("TFrame", background=self.bg_color)
@@ -125,44 +175,42 @@ class PMDGLiveryInstaller:
         self.style.configure("TLabelframe.Label", font=("Arial", 10, "bold"), foreground=self.header_bg, background=self.bg_color)
         self.style.configure("Horizontal.TProgressbar", thickness=20, background=self.accent_color, troughcolor='#e0e0e0')
         self.style.configure("TRadiobutton", background=self.bg_color, font=("Arial", 10))
+        self.style.configure("TCombobox", padding=5, font=("Arial", 10))
         self.style.configure("TNotebook", background=self.bg_color)
         self.style.configure("TNotebook.Tab", padding=[10, 5], font=("Arial", 10))
 
-        # Main Container
         main_container = ttk.Frame(master, style="TFrame")
         main_container.pack(fill=tk.BOTH, expand=True)
 
-        # Header
         header_frame = ttk.Frame(main_container, style="Header.TFrame")
         header_frame.pack(fill=tk.X)
         title_frame = ttk.Frame(header_frame, style="Header.TFrame")
         title_frame.pack(side=tk.LEFT, padx=15, pady=10)
-        ttk.Label(title_frame, text="PMDG 777 Livery Installation Tool", style="Header.TLabel").pack(side=tk.TOP, anchor=tk.W)
-        ttk.Label(title_frame, text="Install custom liveries and generate layout for PMDG 777", foreground="light gray", background=self.header_bg, font=("Arial", 10)).pack(side=tk.TOP, anchor=tk.W, pady=(0, 5))
+        ttk.Label(title_frame, text="PMDG 737 & 777 Livery Installation Tool", style="Header.TLabel").pack(side=tk.TOP, anchor=tk.W)
+        ttk.Label(title_frame, text="Install liveries for PMDG 737 & 777, and generate layout.json", foreground="light gray", background=self.header_bg, font=("Arial", 10)).pack(side=tk.TOP, anchor=tk.W, pady=(0, 5))
 
-        # Main Frame for Notebook
         self.main_frame = ttk.Frame(main_container, padding="20", style="TFrame")
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.notebook = ttk.Notebook(self.main_frame, style="TNotebook")
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
 
-        # Tabs
         setup_tab = ttk.Frame(self.notebook, padding=15, style="TFrame")
-        self.notebook.add(setup_tab, text="  Setup  ") # English
+        self.notebook.add(setup_tab, text="  Setup  ")
         install_tab = ttk.Frame(self.notebook, padding=15, style="TFrame")
-        self.notebook.add(install_tab, text="  Install Livery(s)  ") # English
+        self.notebook.add(install_tab, text="  Install Livery(s)  ")
         help_tab = ttk.Frame(self.notebook, padding=15, style="TFrame")
-        self.notebook.add(help_tab, text="  Help  ") # English
+        self.notebook.add(help_tab, text="  Help  ")
 
-        # Initialize tab content
+        self.aircraft_series_var = tk.StringVar()
+        self.aircraft_variant_var = tk.StringVar()
+
         self._setup_setup_tab(setup_tab)
         self._setup_install_tab(install_tab)
         self._setup_help_tab(help_tab)
 
-        # Status Bar
         status_frame = ttk.Frame(main_container, relief=tk.SUNKEN, borderwidth=1)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        self.status_var = tk.StringVar(value="Ready") # English
+        self.status_var = tk.StringVar(value="Ready")
         ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel", anchor=tk.W, background='').pack(side=tk.LEFT, padx=10, pady=3)
         ttk.Label(status_frame, text=self.app_version, style="Status.TLabel", anchor=tk.E, background='').pack(side=tk.RIGHT, padx=10, pady=3)
 
@@ -171,100 +219,144 @@ class PMDGLiveryInstaller:
 
     def _setup_setup_tab(self, parent: ttk.Frame):
         parent.columnconfigure(1, weight=1)
-        ttk.Label(parent, text="Configuration Settings", style="Subheader.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 15)) # English
+        ttk.Label(parent, text="Configuration Settings", style="Subheader.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 15))
 
-        # Community Folder
-        ttk.Label(parent, text="MSFS Community Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5) # English
+        ttk.Label(parent, text="MSFS Community Folder:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
         self.community_path_var = tk.StringVar()
         ttk.Entry(parent, textvariable=self.community_path_var, width=60).grid(row=1, column=1, sticky=tk.EW, pady=5)
-        ttk.Button(parent, text="Browse...", command=self.select_community_folder).grid(row=1, column=2, padx=5, pady=5) # English
-        ttk.Label(parent, text="Location of your MSFS add-ons (Community folder).", style="Info.TLabel").grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5) # English
-        ttk.Button(parent, text="Find Common Locations", command=self.show_common_locations).grid(row=2, column=0, sticky=tk.W, padx=5) # English
+        ttk.Button(parent, text="Browse...", command=self.select_community_folder).grid(row=1, column=2, padx=5, pady=5)
+        ttk.Label(parent, text="Location of your MSFS add-ons (Community folder).", style="Info.TLabel").grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5)
+        ttk.Button(parent, text="Find Common Locations", command=self.show_common_locations).grid(row=2, column=0, sticky=tk.W, padx=5)
 
-        # PMDG Package Paths (LocalState)
-        pmdg_path_frame = ttk.LabelFrame(parent, text="PMDG Package Paths (for .ini files)", padding=10) # English
+        pmdg_path_frame = ttk.LabelFrame(parent, text="PMDG Aircraft Base Package Paths (LocalState/packages - for .ini files)", padding=10)
         pmdg_path_frame.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(20, 5))
         pmdg_path_frame.columnconfigure(1, weight=1)
-        
-        self.pmdg_77er_path_var = tk.StringVar() # Initialize here
-        self.pmdg_77w_path_var = tk.StringVar()
-        self.pmdg_77f_path_var = tk.StringVar()
-        
+
+        self.pmdg_77er_path_var = tk.StringVar(); self.pmdg_77w_path_var = tk.StringVar(); self.pmdg_77f_path_var = tk.StringVar()
+        self.pmdg_736_path_var = tk.StringVar(); self.pmdg_737_path_var = tk.StringVar()
+        self.pmdg_738_path_var = tk.StringVar(); self.pmdg_739_path_var = tk.StringVar()
+
         paths_to_setup = [
-            ("777-200ER Path:", self.pmdg_77er_path_var, "pmdg-aircraft-77er"), # English
-            ("777-300ER Path:", self.pmdg_77w_path_var, "pmdg-aircraft-77w"), # English
-            ("777F Path:", self.pmdg_77f_path_var, "pmdg-aircraft-77f"),       # English
+            ("777-200ER Path:", self.pmdg_77er_path_var, "pmdg-aircraft-77er"),
+            ("777-300ER Path:", self.pmdg_77w_path_var, "pmdg-aircraft-77w"),
+            ("777F Path:", self.pmdg_77f_path_var, "pmdg-aircraft-77f"),
+            ("737-600 Path:", self.pmdg_736_path_var, "pmdg-aircraft-736"),
+            ("737-700 (Base) Path:", self.pmdg_737_path_var, "pmdg-aircraft-737"),
+            ("737-800 (Base) Path:", self.pmdg_738_path_var, "pmdg-aircraft-738"),
+            ("737-900 (Base) Path:", self.pmdg_739_path_var, "pmdg-aircraft-739"),
         ]
+
         for i, (label_text, var, expected_prefix) in enumerate(paths_to_setup):
-            ttk.Label(pmdg_path_frame, text=label_text).grid(row=i, column=0, sticky=tk.W, padx=5, pady=5)
-            ttk.Entry(pmdg_path_frame, textvariable=var, width=55).grid(row=i, column=1, sticky=tk.EW, pady=5)
-            ttk.Button(pmdg_path_frame, text="Browse...", command=lambda v=var, p=expected_prefix: self.select_pmdg_package_folder(v, p)).grid(row=i, column=2, padx=5, pady=5) # English
+            ttk.Label(pmdg_path_frame, text=label_text).grid(row=i, column=0, sticky=tk.W, padx=5, pady=3)
+            ttk.Entry(pmdg_path_frame, textvariable=var, width=55).grid(row=i, column=1, sticky=tk.EW, pady=3)
+            ttk.Button(pmdg_path_frame, text="Browse...", command=lambda v=var, p=expected_prefix: self.select_pmdg_package_folder(v, p)).grid(row=i, column=2, padx=5, pady=3)
+
+        current_row_after_paths_in_frame = len(paths_to_setup)
+        ttk.Label(pmdg_path_frame,
+                  text="Path to the PMDG aircraft BASE package (e.g., 'pmdg-aircraft-77er', 'pmdg-aircraft-737-600') in '...\\LocalState\\packages'. Used for .ini handling.",
+                  style="Info.TLabel", wraplength=550, justify=tk.LEFT).grid(row=current_row_after_paths_in_frame, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(5,0))
         
-        ttk.Label(pmdg_path_frame, text="Path to the specific PMDG aircraft package folder (e.g., pmdg-aircraft-77er) within '...\\LocalState\\packages'.", style="Info.TLabel").grid(row=len(paths_to_setup), column=1, columnspan=2, sticky=tk.W, padx=5, pady=(5,0)) # English
-
-        # Reference Livery Folder
-        ttk.Label(parent, text="Reference 777 Livery Folder:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=(20, 5)) # English
+        # Corrected row placement for elements after pmdg_path_frame
+        # pmdg_path_frame is at parent grid row 3.
+        # Next available row in parent grid is 4.
+        reference_row_start_in_parent = 4
+        ttk.Label(parent, text="Reference PMDG Livery Folder:").grid(row=reference_row_start_in_parent, column=0, sticky=tk.W, padx=5, pady=(20, 5))
         self.reference_path_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self.reference_path_var, width=60).grid(row=4, column=1, sticky=tk.EW, pady=(20, 5))
-        ttk.Button(parent, text="Browse...", command=self.select_reference_folder).grid(row=4, column=2, padx=5, pady=(20, 5)) # English
-        ttk.Label(parent, text="Any installed PMDG 777 livery folder (for manifest/layout templates).", style="Info.TLabel").grid(row=5, column=1, columnspan=2, sticky=tk.W, padx=5) # English
+        ttk.Entry(parent, textvariable=self.reference_path_var, width=60).grid(row=reference_row_start_in_parent, column=1, sticky=tk.EW, pady=(20, 5))
+        ttk.Button(parent, text="Browse...", command=self.select_reference_folder).grid(row=reference_row_start_in_parent, column=2, padx=5, pady=(20, 5))
+        ttk.Label(parent, text="Any installed PMDG 777 or 737 livery folder (for manifest/layout templates).", style="Info.TLabel").grid(row=reference_row_start_in_parent + 1, column=1, columnspan=2, sticky=tk.W, padx=5)
 
-        # Save Button
-        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=25)
-        ttk.Button(parent, text="Save Settings", command=self.save_config).grid(row=7, column=0, columnspan=3, pady=10) # English
+        save_button_row_in_parent = reference_row_start_in_parent + 2
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(row=save_button_row_in_parent, column=0, columnspan=3, sticky=tk.EW, pady=25)
+        ttk.Button(parent, text="Save Settings", command=self.save_config).grid(row=save_button_row_in_parent + 1, column=0, columnspan=3, pady=10)
+
+    def _on_series_select(self, event=None):
+        selected_series = self.aircraft_series_var.get()
+        variants = self.AIRCRAFT_HIERARCHY.get(selected_series, [])
+        
+        self.variant_combobox['values'] = variants
+        if variants:
+            self.aircraft_variant_var.set("") 
+            self.variant_combobox.set("") # Clear visual selection
+            self.variant_combobox.current(0) 
+            self.aircraft_variant_var.set(self.variant_combobox.get()) 
+            self.variant_combobox.config(state='readonly')
+        else:
+            self.aircraft_variant_var.set("")
+            self.variant_combobox.set("")
+            self.variant_combobox.config(state='disabled')
+        self.log(f"Aircraft series selected: {selected_series}. Variants available: {len(variants)}", "DETAIL")
 
     def _setup_install_tab(self, parent: ttk.Frame):
         parent.columnconfigure(1, weight=1)
-        parent.rowconfigure(8, weight=1) # Log area expansion
 
-        ttk.Label(parent, text="Install New Livery(s)", style="Subheader.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 15)) # English
-        ttk.Label(parent, text="Livery File(s):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5) # English
+        ttk.Label(parent, text="Install New Livery(s)", style="Subheader.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 15))
+
+        current_row = 1
+        ttk.Label(parent, text="Livery File(s):").grid(row=current_row, column=0, sticky=tk.W, padx=5, pady=5)
         self.livery_zip_display_var = tk.StringVar()
         self.livery_zip_entry = ttk.Entry(parent, textvariable=self.livery_zip_display_var, width=60, state='readonly')
-        self.livery_zip_entry.grid(row=1, column=1, sticky=tk.EW, pady=5)
-        ttk.Button(parent, text="Browse...", command=self.select_livery_files).grid(row=1, column=2, padx=5, pady=5) # English
-        ttk.Label(parent, text="Select one or more archive files (.zip or .ptp).", style="Info.TLabel").grid(row=2, column=1, sticky=tk.W, padx=5) # English
-        ttk.Label(parent, text="IMPORTANT! If selecting multiple files, they MUST be for the SAME aircraft variant.", style="Warn.Info.TLabel").grid(row=3, column=1, columnspan=2, sticky=tk.W, padx=5) # English
+        self.livery_zip_entry.grid(row=current_row, column=1, sticky=tk.EW, pady=5)
+        ttk.Button(parent, text="Browse...", command=self.select_livery_files).grid(row=current_row, column=2, padx=5, pady=5)
+        current_row += 1
+        ttk.Label(parent, text="Select one or more archive files (.zip or .ptp).", style="Info.TLabel").grid(row=current_row, column=1, sticky=tk.W, padx=5)
+        current_row += 1
+        ttk.Label(parent, text="IMPORTANT! If selecting multiple files, they MUST be for the SAME aircraft variant.", style="Warn.Info.TLabel").grid(row=current_row, column=1, columnspan=2, sticky=tk.W, padx=5)
+        current_row += 1
 
-        ttk.Label(parent, text="Aircraft Variant:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=(20, 5)) # English
-        self.aircraft_variant_var = tk.StringVar()
-        variant_frame = ttk.Frame(parent, style="TFrame")
-        variant_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=(20, 5))
-        ttk.Radiobutton(variant_frame, text="777-200ER", variable=self.aircraft_variant_var, value="200ER").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(variant_frame, text="777-300ER", variable=self.aircraft_variant_var, value="300ER").pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(variant_frame, text="777F", variable=self.aircraft_variant_var, value="F").pack(side=tk.LEFT)
-        ttk.Label(parent, text="You must select an aircraft variant.", style="Info.TLabel").grid(row=5, column=1, columnspan=2, sticky=tk.W, padx=5) # English
+        aircraft_selection_frame = ttk.LabelFrame(parent, text="Aircraft Model & Variant", padding=10)
+        aircraft_selection_frame.grid(row=current_row, column=0, columnspan=3, sticky=tk.EW, pady=(20,5), padx=5)
+        aircraft_selection_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(aircraft_selection_frame, text="Aircraft Series:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.series_combobox = ttk.Combobox(aircraft_selection_frame, textvariable=self.aircraft_series_var,
+                                            values=list(self.AIRCRAFT_HIERARCHY.keys()), state='readonly', width=30, style="TCombobox")
+        self.series_combobox.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        self.series_combobox.bind("<<ComboboxSelected>>", self._on_series_select)
 
-        ttk.Label(parent, text="Livery Name (in-sim):").grid(row=6, column=0, sticky=tk.W, padx=5, pady=(20, 5)) # English
+        ttk.Label(aircraft_selection_frame, text="Variant/Sub-Model:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.variant_combobox = ttk.Combobox(aircraft_selection_frame, textvariable=self.aircraft_variant_var,
+                                             state='disabled', width=30, style="TCombobox")
+        self.variant_combobox.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+        current_row += 1 # For the LabelFrame
+
+        ttk.Label(parent, text="Select the aircraft series first, then the specific variant.", style="Info.TLabel").grid(row=current_row, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(0,10))
+        current_row +=1
+
+        ttk.Label(parent, text="Livery Name (in-sim):").grid(row=current_row, column=0, sticky=tk.W, padx=5, pady=(15, 5))
         self.custom_name_var = tk.StringVar()
         self.custom_name_entry = ttk.Entry(parent, textvariable=self.custom_name_var, width=60)
-        self.custom_name_entry.grid(row=6, column=1, sticky=tk.EW, pady=(20, 5))
-        ttk.Label(parent, text="Optional. Ignored if multiple files selected (will be auto-detected).", style="Info.TLabel").grid(row=7, column=1, columnspan=2, sticky=tk.W, padx=5) # English
+        self.custom_name_entry.grid(row=current_row, column=1, sticky=tk.EW, pady=(15, 5))
+        current_row +=1
+        ttk.Label(parent, text="Optional. Ignored if multiple files selected (auto-detected from archive/aircraft.cfg).", style="Info.TLabel").grid(row=current_row, column=1, columnspan=2, sticky=tk.W, padx=5)
+        current_row +=1
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(row=8, column=0, columnspan=3, sticky=tk.EW, pady=25)
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(row=current_row, column=0, columnspan=3, sticky=tk.EW, pady=20)
+        current_row +=1
         
+        action_frame_row = current_row # Save the row where action_frame is placed
         action_frame = ttk.Frame(parent, style="TFrame")
-        action_frame.grid(row=9, column=0, columnspan=3, sticky=tk.NSEW, pady=10)
+        action_frame.grid(row=action_frame_row, column=0, columnspan=3, sticky=tk.NSEW, pady=10)
         action_frame.columnconfigure(0, weight=1)
-        action_frame.rowconfigure(2, weight=1) 
+        action_frame.rowconfigure(2, weight=1)
 
-        self.install_button = ttk.Button(action_frame, text="Install Livery(s) & Generate Layout", command=self.start_install_thread, style="Accent.TButton") # English
+        self.install_button = ttk.Button(action_frame, text="Install Livery(s) & Generate Layout", command=self.start_install_thread, style="Accent.TButton")
         self.install_button.grid(row=0, column=0, pady=(0, 15))
 
         progress_frame = ttk.Frame(action_frame, style="TFrame")
         progress_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 10))
         progress_frame.columnconfigure(1, weight=1)
-        ttk.Label(progress_frame, text="Progress:").grid(row=0, column=0, sticky=tk.W) # English
+        ttk.Label(progress_frame, text="Progress:").grid(row=0, column=0, sticky=tk.W)
         self.progress_var = tk.DoubleVar()
         self.progress = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100, style="Horizontal.TProgressbar")
         self.progress.grid(row=0, column=1, sticky=tk.EW, padx=5)
 
-        log_frame = ttk.LabelFrame(action_frame, text="Installation Log", style="TLabelframe") # English
+        log_frame = ttk.LabelFrame(action_frame, text="Installation Log", style="TLabelframe")
         log_frame.grid(row=2, column=0, sticky=tk.NSEW)
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(log_frame, height=12, width=80, wrap=tk.WORD, bd=0, font=("Courier New", 9), relief=tk.FLAT, background="white")
+        self.log_text = tk.Text(log_frame, height=10, width=80, wrap=tk.WORD, bd=0, font=("Courier New", 9), relief=tk.FLAT, background="white")
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW, padx=5, pady=5)
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky=tk.NS, padx=(0,5), pady=5)
@@ -280,6 +372,9 @@ class PMDGLiveryInstaller:
             self.log_text.tag_configure(tag, foreground=color, font=font_options)
         self.log_text.tag_configure("INFO", foreground="black", font=("Courier New", 9))
 
+        parent.rowconfigure(action_frame_row, weight=1)
+
+
     def _setup_help_tab(self, parent: ttk.Frame):
         help_canvas = tk.Canvas(parent, highlightthickness=0, background=self.bg_color)
         help_scrollbar = ttk.Scrollbar(parent, orient="vertical", command=help_canvas.yview)
@@ -289,7 +384,7 @@ class PMDGLiveryInstaller:
         canvas_window = help_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         help_canvas.configure(yscrollcommand=help_scrollbar.set)
         
-        def rebind_wraplength(event): # Closure to update wraplengths
+        def rebind_wraplength(event):
             width = event.width 
             for child in scrollable_frame.winfo_children():
                 if isinstance(child, ttk.Label) and hasattr(child, '_original_indent'):
@@ -304,34 +399,20 @@ class PMDGLiveryInstaller:
 
         current_row = 0
         
-        def add_section_header(text):
-            nonlocal current_row
-            lbl = ttk.Label(scrollable_frame, text=text, style="Subheader.TLabel")
-            lbl.grid(row=current_row, column=0, sticky="w", pady=(15, 5)); lbl._original_indent = 0
-            current_row += 1
-        
-        def add_text(text, indent=0, style="TLabel"):
-            nonlocal current_row
-            lbl = ttk.Label(scrollable_frame, text=text, justify=tk.LEFT, style=style, background=self.bg_color)
-            lbl.grid(row=current_row, column=0, sticky="w", padx=(indent * 20, 0)); lbl._original_indent = indent
-            current_row += 1
-        
-        def add_bold_text(text, indent=0):
-            nonlocal current_row
-            lbl = ttk.Label(scrollable_frame, text=text, justify=tk.LEFT, font=("Arial", 10, "bold"), background=self.bg_color)
-            lbl.grid(row=current_row, column=0, sticky="w", padx=(indent * 20, 0), pady=(5,0)); lbl._original_indent = indent
-            current_row += 1
+        def add_section_header(text): nonlocal current_row; lbl = ttk.Label(scrollable_frame, text=text, style="Subheader.TLabel"); lbl.grid(row=current_row, column=0, sticky="w", pady=(15, 5)); lbl._original_indent = 0; current_row += 1
+        def add_text(text, indent=0, style="TLabel"): nonlocal current_row; lbl = ttk.Label(scrollable_frame, text=text, justify=tk.LEFT, style=style, background=self.bg_color); lbl.grid(row=current_row, column=0, sticky="w", padx=(indent * 20, 0)); lbl._original_indent = indent; current_row += 1
+        def add_bold_text(text, indent=0): nonlocal current_row; lbl = ttk.Label(scrollable_frame, text=text, justify=tk.LEFT, font=("Arial", 10, "bold"), background=self.bg_color); lbl.grid(row=current_row, column=0, sticky="w", padx=(indent * 20, 0), pady=(5,0)); lbl._original_indent = indent; current_row += 1
 
-        # --- Help Content (English) ---
+        # --- Help Content (English) - Needs further review and updates for 737 specifics ---
         add_section_header("Quick Start Guide")
         add_text("1. Go to the Setup tab:")
         add_text("- Select your MSFS Community folder.", indent=1)
-        add_text("- Set the 'PMDG Package Path' for each 777 variant you own (important for .ini files). Point to the specific PMDG aircraft folder (e.g., pmdg-aircraft-77er) inside ...\\LocalState\\packages.", indent=1)
-        add_text("- Select any existing installed PMDG 777 livery folder as a Reference.", indent=1)
+        add_text("- Set the 'PMDG Aircraft Base Package Path' for each aircraft type (777s, 737-600, 737-700 Base, etc.) you own. This points to the aircraft's main folder in ...\\LocalState\\packages.", indent=1)
+        add_text("- Select any existing installed PMDG 777 or 737 livery folder as a Reference.", indent=1)
         add_text("- Click Save Settings.", indent=1)
         add_text("2. Go to the Install Livery(s) tab:")
         add_text("- Browse for your livery archive file(s) (.zip or .ptp).", indent=1)
-        add_text("- IMPORTANT! Choose the correct Aircraft Variant (777-200ER, 777-300ER, or 777F). This is mandatory!", indent=1)
+        add_text("- Select the Aircraft Series (e.g., Boeing 737 NG), then the specific Variant/Sub-Model (e.g., 737-800BBJ2). This is mandatory!", indent=1)
         add_text("- If selecting multiple files, ensure ALL are for the same variant you chose.", indent=1)
         add_text("- Optionally, enter a Livery Name if you selected a SINGLE file.", indent=1)
         add_text("- Click 'Install Livery(s) & Generate Layout'.", indent=1)
@@ -341,10 +422,10 @@ class PMDGLiveryInstaller:
         add_section_header("Configuration Details")
         add_bold_text("MSFS Community Folder:")
         add_text("This is where MSFS add-ons are installed.", indent=1)
-        add_bold_text("PMDG Package Paths (LocalState):")
-        add_text("Path to the specific PMDG aircraft package folder (e.g., 'pmdg-aircraft-77er') inside the 'packages' folder in your MSFS LocalState. Used for copying renamed .ini files.", indent=1)
-        add_bold_text("Reference 777 Livery Folder:")
-        add_text("Needed for copying manifest.json and layout.json templates if the livery package is new.", indent=1)
+        add_bold_text("PMDG Aircraft Base Package Paths (LocalState):")
+        add_text("Path to the specific PMDG aircraft BASE package folder (e.g., 'pmdg-aircraft-77er', 'pmdg-aircraft-737-600') inside the 'packages' folder in your MSFS LocalState. Used for copying renamed .ini files.", indent=1)
+        add_bold_text("Reference PMDG Livery Folder:")
+        add_text("Needed for copying manifest.json and layout.json templates if the livery package is new. Can be from any PMDG 777 or 737 livery.", indent=1)
         add_bold_text(f"{PTP_CONVERTER_EXE_NAME}:")
         add_text(f"This tool requires '{PTP_CONVERTER_EXE_NAME}' to process .ptp files. Ensure it is in the same folder as this livery installer.", indent=1)
         add_text("If missing, .ptp file installation will fail.", indent=1)
@@ -352,46 +433,44 @@ class PMDGLiveryInstaller:
         add_text("MSFS and its add-ons can use very long file paths. To ensure this tool can correctly scan all livery files, "
                  "especially during 'layout.json' generation, enabling 'Win32 long paths' in your Windows OS is recommended.", indent=1)
         add_text("Search online for 'Enable Win32 long paths Windows 10/11' for instructions. This application is also packaged to be long-path aware.", indent=1)
-        add_section_header("Troubleshooting") # English
-        add_bold_text("Livery Not Appearing in MSFS:") # English
-        add_text("- Check the Installation Log for ERROR messages, especially during 'Generating layout.json' or 'Processing options.ini' steps.", indent=1) # English
-        add_text("- Verify that the MSFS Community Folder path is correct in Setup.", indent=1) # English
-        add_text("- Ensure you selected the correct Aircraft Variant during installation.", indent=1) # English
-        add_text("- Ensure the dependency in the package's manifest.json (e.g., in pmdg-aircraft-77w-liveries) matches the base aircraft (e.g., 'pmdg-aircraft-77w'). The tool attempts to fix this, but check the log.", indent=1) # English
-        add_text("- For 777-200ER, check the log if the correct engine type (GE/RR/PW) was detected and applied to aircraft.cfg.", indent=1) # English
-        add_text("- Verify the 'PMDG Package Path (LocalState)' for the relevant variant is correct if you expected an .ini file to be copied.", indent=1) # English
-        add_text("- Restart MSFS. A restart is sometimes needed.", indent=1) # English
-        add_text("- Check the MSFS Content Manager for the livery package.", indent=1) # English
-        add_text("- If layout generation failed or was skipped (see log), new liveries won't appear until this step completes successfully for the entire batch.", indent=1) # English
-
-        add_bold_text("Installation Errors:") # English
-        add_text("- Ensure the archive file(s) (.zip or .ptp) are not corrupt. ZIPs should contain expected folders (texture.*, model, aircraft.cfg, optionally options.ini or <atc_id>.ini).", indent=1) # English
-        add_text(f"- For .ptp files, ensure {PTP_CONVERTER_EXE_NAME} is functional and in the same folder as this application.", indent=1) # English
-        add_text("- Verify the selected Reference Livery Folder is valid and functional.", indent=1) # English
         
-        add_bold_text("Nested ZIPs:") # English
-        add_text("- The tool attempts to detect and install liveries from ZIP files contained within a primary selected ZIP file (e.g., a 'pack' zip).", indent=1) # English
-        add_text("- Check the log if a 'pack' file fails; it might indicate an unexpected internal structure.", indent=1) # English
-        
-        add_bold_text("RAR Files:") # English
-        add_text("- This tool only supports ZIP and PTP (via ptp_converter.exe) archive files.", indent=1) # English
+        add_section_header("Troubleshooting")
+        add_bold_text("Livery Not Appearing in MSFS:")
+        add_text("- Check the Installation Log for ERROR messages, especially during 'Generating layout.json' or 'Processing options.ini' steps.", indent=1)
+        add_text("- Verify that the MSFS Community Folder path is correct in Setup.", indent=1)
+        add_text("- Ensure you selected the correct Aircraft Series and Variant during installation.", indent=1) # MODIFIED
+        add_text("- Ensure the dependency in the package's manifest.json (e.g., in pmdg-aircraft-77w-liveries) matches the base aircraft (e.g., 'pmdg-aircraft-77w'). The tool attempts to fix this, but check the log.", indent=1)
+        add_text("- For 777-200ER, check the log if the correct engine type (GE/RR/PW) was detected and applied to aircraft.cfg.", indent=1)
+        add_text("- Verify the 'PMDG Aircraft Base Package Path (LocalState)' for the relevant aircraft type is correct if you expected an .ini file to be copied.", indent=1) # MODIFIED
+        add_text("- Restart MSFS. A restart is sometimes needed.", indent=1)
+        add_text("- Check the MSFS Content Manager for the livery package.", indent=1)
+        add_text("- If layout generation failed or was skipped (see log), new liveries won't appear until this step completes successfully for the entire batch.", indent=1)
 
-        add_section_header("About") # English
-        add_text(f"PMDG 777 Livery Installer {self.app_version}")
-        add_text("This tool prepares, copies, and configures livery files for the PMDG 777 family in MSFS.", style="TLabel") # English
+        add_bold_text("Installation Errors:")
+        add_text("- Ensure the archive file(s) (.zip or .ptp) are not corrupt. ZIPs should contain expected folders (texture.*, model, aircraft.cfg, optionally options.ini or <atc_id>.ini).", indent=1)
+        add_text(f"- For .ptp files, ensure {PTP_CONVERTER_EXE_NAME} is functional and in the same folder as this application.", indent=1)
+        add_text("- Verify the selected Reference Livery Folder is valid and functional.", indent=1)
+        
+        add_bold_text("Nested ZIPs:")
+        add_text("- The tool attempts to detect and install liveries from ZIP files contained within a primary selected ZIP file (e.g., a 'pack' zip).", indent=1)
+        add_text("- Check the log if a 'pack' file fails; it might indicate an unexpected internal structure.", indent=1)
+        
+        add_bold_text("RAR Files:")
+        add_text("- This tool only supports ZIP and PTP (via ptp_converter.exe) archive files.", indent=1)
+
+        add_section_header("About")
+        add_text(f"PMDG 737 & 777 Livery Installer {self.app_version}")
+        add_text("This tool prepares, copies, and configures livery files for the PMDG 737 & 777 families in MSFS.", style="TLabel")
         add_text(f"It handles folder creation, file extraction (ZIPs, including nested; PTPs using {PTP_CONVERTER_EXE_NAME}), " 
                  "aircraft.cfg modification, options.ini/<atc_id>.ini handling, and automatically generates "
-                 "layout.json and updates manifest.json.", style="TLabel") # English
-        add_text("Disclaimer: Use at your own risk. Not affiliated with PMDG or Microsoft.", style="Info.TLabel") # English
+                 "layout.json and updates manifest.json.", style="TLabel")
+        add_text("Disclaimer: Use at your own risk. Not affiliated with PMDG or Microsoft.", style="Info.TLabel")
 
-        # Force an initial configure event to set initial wraplengths for help text
         parent.update_idletasks() 
         for child in scrollable_frame.winfo_children():
             if isinstance(child, ttk.Label) and hasattr(child, '_original_indent'):
                 indent_pixels = child._original_indent * 20
-                # Use scrollable_frame.winfo_width() as it's the container for these labels
                 child.config(wraplength=max(100, scrollable_frame.winfo_width() - indent_pixels - 30))
-
 
     def show_common_locations(self):
         common_locations = """Common MSFS Community Folder Locations:
@@ -408,14 +487,14 @@ Custom Installation Drive (Example D:):
 D:\\MSFS\\Community (If you chose a custom path during MSFS installation)
 
 Xbox App / PC Game Pass (May Vary):
-Check drive settings under the Xbox app, often involves hidden/protected folders like 'WpSystem' or 'WindowsApps'. Access might be restricted. Using Store/Steam paths is more common for PC users.
+Check drive settings under the Xbox app, often involves hidden/protected folders like 'WpSystem' or 'WindowsApps'. Access might be restricted.
 
 Finding AppData:
 Press Windows Key + R, type `%appdata%` and press Enter to open the Roaming folder.
 Press Windows Key + R, type `%localappdata%` and press Enter to open the Local folder.
-""" # English
+"""
         location_window = tk.Toplevel(self.master)
-        location_window.title("Common Community Folder Locations") # English
+        location_window.title("Common Community Folder Locations")
         location_window.geometry("700x400")
         location_window.resizable(False, False)
         location_window.transient(self.master)
@@ -429,8 +508,8 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
         text_widget.config(state=tk.DISABLED)
         btn_frame = ttk.Frame(win_frame, padding=(0, 10, 0, 0), style="TFrame")
         btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="Copy Info to Clipboard", command=lambda: self.copy_to_clipboard(common_locations, location_window)).pack(side=tk.LEFT, padx=5) # English
-        ttk.Button(btn_frame, text="Close", command=location_window.destroy).pack(side=tk.RIGHT, padx=5) # English
+        ttk.Button(btn_frame, text="Copy Info to Clipboard", command=lambda: self.copy_to_clipboard(common_locations, location_window)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=location_window.destroy).pack(side=tk.RIGHT, padx=5)
         location_window.update_idletasks()
         x = self.master.winfo_x() + (self.master.winfo_width() // 2) - (location_window.winfo_width() // 2)
         y = self.master.winfo_y() + (self.master.winfo_height() // 2) - (location_window.winfo_height() // 2)
@@ -440,10 +519,10 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
         try:
             self.master.clipboard_clear()
             self.master.clipboard_append(text)
-            self.master.update()
-            messagebox.showinfo("Copied", "Locations copied to clipboard.", parent=parent_window) # English
+            self.master.update() # Essential on some systems for clipboard to update
+            messagebox.showinfo("Copied", "Locations copied to clipboard.", parent=parent_window)
         except tk.TclError:
-            messagebox.showwarning("Clipboard Error", "Could not access the clipboard.", parent=parent_window) # English
+            messagebox.showwarning("Clipboard Error", "Could not access the clipboard.", parent=parent_window)
 
     def log(self, message: str, level: str = "INFO"):
         if threading.current_thread() is not threading.main_thread():
@@ -457,93 +536,94 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
             self.log_text.config(state=tk.NORMAL)
             self.log_text.insert(tk.END, prefix + message + "\n", tag_to_use)
             self.log_text.config(state=tk.DISABLED)
-            self.log_text.see(tk.END)
+            self.log_text.see(tk.END) # Auto-scroll
         except Exception as e:
-            print(f"Error logging message: {e}") 
+            print(f"Error logging message: {e}")
 
     def select_community_folder(self):
         current_path = self.community_path_var.get()
         initial_dir = current_path if Path(current_path).is_dir() else str(Path.home())
-        folder = filedialog.askdirectory(title="Select MSFS Community Folder", initialdir=initial_dir) # English
+        folder = filedialog.askdirectory(title="Select MSFS Community Folder", initialdir=initial_dir)
         if folder:
             self.community_path_var.set(folder)
-            self.log(f"Community Folder selected: {folder}", "DETAIL") # English
+            self.log(f"Community Folder selected: {folder}", "DETAIL")
 
     def _get_parent_localstate_packages_path(self) -> Path | None:
+        # Try to find the MSFS packages folder where PMDG aircraft base packages are stored
         try:
             local_app_data = os.getenv('LOCALAPPDATA')
-            if local_app_data:
+            if local_app_data: # MS Store version often here
                 packages_dir = Path(local_app_data) / "Packages"
                 if packages_dir.is_dir():
                     msfs_pkg_pattern = "Microsoft.FlightSimulator_*_8wekyb3d8bbwe"
                     for item in packages_dir.iterdir():
                         if item.is_dir() and re.match(msfs_pkg_pattern, item.name, re.IGNORECASE):
-                            potential_path = item / "LocalState" / "packages"
+                            potential_path = item / "LocalState" / "packages" # This is where PMDG base aircraft are
                             if potential_path.is_dir(): return potential_path
-            app_data = os.getenv('APPDATA')
+            app_data = os.getenv('APPDATA') # Steam version often here
             if app_data:
-                steam_msfs_packages_path = Path(app_data) / "Microsoft Flight Simulator" / "Packages"
-                if steam_msfs_packages_path.is_dir():
-                    return steam_msfs_packages_path.parent 
+                steam_msfs_base_path = Path(app_data) / "Microsoft Flight Simulator"
+                potential_steam_path = steam_msfs_base_path / "LocalState" / "packages"
+                if potential_steam_path.is_dir():
+                    return potential_steam_path
         except Exception as e:
-            self.log(f"Error trying to auto-detect LocalState packages path: {e}", "DEBUG") # English
-        return Path.home()
+            self.log(f"Error trying to auto-detect LocalState packages path: {e}", "DEBUG")
+        return Path.home() # Fallback if not found
 
     def select_pmdg_package_folder(self, target_var: tk.StringVar, expected_folder_prefix: str):
         initial_dir_guess = self._get_parent_localstate_packages_path() or Path.home()
         folder = filedialog.askdirectory(
-            title=f"Select PMDG Package Folder (e.g., {expected_folder_prefix}) in ...LocalState\\packages", # English
+            title=f"Select PMDG Base Package (e.g., {expected_folder_prefix}) in ...LocalState\\packages",
             initialdir=str(initial_dir_guess)
         )
         if folder:
             p_folder = Path(folder)
             folder_name_lower = p_folder.name.lower()
-            if folder_name_lower in EXPECTED_PMDG_PACKAGE_NAMES:
+            if folder_name_lower in EXPECTED_PMDG_BASE_PACKAGE_NAMES:
                 if folder_name_lower == expected_folder_prefix.lower():
-                    # More lenient check: ensure it's inside a 'packages' folder, which is inside 'LocalState'
                     if p_folder.parent and p_folder.parent.name.lower() == 'packages' and \
                        p_folder.parent.parent and p_folder.parent.parent.name.lower() == 'localstate':
                         target_var.set(str(p_folder))
-                        self.log(f"PMDG Package Path ({expected_folder_prefix}) set: {p_folder}", "DETAIL") # English
+                        self.log(f"PMDG Base Package Path ({expected_folder_prefix}) set: {p_folder}", "DETAIL")
                     else:
-                        messagebox.showwarning("Potential Incorrect Path", # English
+                        messagebox.showwarning("Potential Incorrect Path",
                                              f"The folder '{p_folder.name}' is a valid PMDG package, "
                                              f"but it does not appear to be inside a '...\\LocalState\\packages' structure.\n\n"
-                                             f"Please ensure this is the correct path.")
+                                             f"Please ensure this is the correct path for the base aircraft package.")
                         target_var.set(str(p_folder))
-                        self.log(f"PMDG Package Path ({expected_folder_prefix}) set (Warning: verify 'LocalState\\packages' structure): {p_folder}", "WARNING") # English
+                        self.log(f"PMDG Base Package Path ({expected_folder_prefix}) set (Warning: verify 'LocalState\\packages' structure): {p_folder}", "WARNING")
                 else:
-                    messagebox.showerror("Incorrect Variant", # English
-                                         f"You selected the folder '{p_folder.name}', but a folder like '{expected_folder_prefix}' was expected.\n\n"
-                                         f"Please select the correct PMDG package folder for this variant.")
-                    self.log(f"Incorrect PMDG package variant selected for {expected_folder_prefix}. Selected: {folder}", "ERROR") # English
+                    messagebox.showerror("Incorrect Variant/Type",
+                                         f"You selected the folder '{p_folder.name}', but a folder named '{expected_folder_prefix}' was expected for this specific input field.\n\n"
+                                         f"Please select the correct PMDG base aircraft package folder for this entry.")
+                    self.log(f"Incorrect PMDG base package selected for {expected_folder_prefix}. Selected: {folder}", "ERROR")
             else:
-                messagebox.showerror("Invalid Folder", # English
-                                     f"The selected folder '{p_folder.name}' does not appear to be a valid PMDG package folder (e.g., {expected_folder_prefix}).\n\n"
+                messagebox.showerror("Invalid Folder",
+                                     f"The selected folder '{p_folder.name}' does not appear to be a recognized PMDG base aircraft package folder (e.g., {expected_folder_prefix}).\n\n"
                                      f"Please select the correct folder within '...\\LocalState\\packages'.")
-                self.log(f"Invalid PMDG Package Path selected: {folder}", "ERROR") # English
+                self.log(f"Invalid PMDG Base Package Path selected: {folder}", "ERROR")
 
     def select_reference_folder(self):
         current_path = self.reference_path_var.get()
         initial_dir = current_path if Path(current_path).is_dir() else \
                       (self.community_path_var.get() if Path(self.community_path_var.get()).is_dir() else str(Path.home()))
-        folder = filedialog.askdirectory(title="Select Reference PMDG 777 Livery Folder", initialdir=initial_dir) # English
+        folder = filedialog.askdirectory(title="Select Reference PMDG Livery Folder (737 or 777)", initialdir=initial_dir)
         if folder:
             p_folder = Path(folder)
             if (p_folder / "manifest.json").is_file() and (p_folder / "layout.json").is_file():
                 self.reference_path_var.set(str(p_folder))
-                self.log(f"Reference livery folder selected: {p_folder}", "DETAIL") # English
+                self.log(f"Reference livery folder selected: {p_folder}", "DETAIL")
             else:
                 missing = [f_name for f_name in ["manifest.json", "layout.json"] if not (p_folder / f_name).is_file()]
-                messagebox.showwarning("Invalid Reference", f"The selected folder is missing: {', '.join(missing)}.") # English
-                self.log(f"Invalid reference folder (missing {', '.join(missing)}): {p_folder}", "WARNING") # English
+                messagebox.showwarning("Invalid Reference", f"The selected folder is missing: {', '.join(missing)}.")
+                self.log(f"Invalid reference folder (missing {', '.join(missing)}): {p_folder}", "WARNING")
 
     def select_livery_files(self):
         initial_dir = str(Path.home() / "Downloads") if (Path.home() / "Downloads").is_dir() else str(Path.home())
         files = filedialog.askopenfilenames(
-            title="Select Livery Archive File(s) (.zip or .ptp)", # English
+            title="Select Livery Archive File(s) (.zip or .ptp)",
             filetypes=[
-                ("Supported Livery Archives", "*.zip *.ptp"), ("ZIP archives", "*.zip"), # English
+                ("Supported Livery Archives", "*.zip *.ptp"), ("ZIP archives", "*.zip"),
                 ("PMDG PTP files", "*.ptp"), ("All files", "*.*")
             ], initialdir=initial_dir
         )
@@ -553,69 +633,72 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
             if num_files == 1:
                 display_text = Path(self.selected_zip_files[0]).name
                 self.custom_name_entry.config(state=tk.NORMAL)
-                self.log(f"Livery file selected: {display_text}", "DETAIL") # English
+                self.log(f"Livery file selected: {display_text}", "DETAIL")
                 if not self.custom_name_var.get() and \
                    (display_text.lower().endswith((".zip", ".ptp"))):
                     base_name = Path(display_text).stem
-                    clean_name = re.sub(r'^(pmdg[-_]?)?(777[-_]?(200er|300er|f|w)?[-_]?)', '', base_name, flags=re.IGNORECASE).strip('-_ ')
+                    clean_name = re.sub(r'^(pmdg[-_]?)?(777|737|736|738|739|bbj|bdsf|bcf|er|f|w)?([-_]?(200er|300er|f|w|600|700|800|900|bbj|bbj2|bdsf|bcf|er))?([-_]?)', '', base_name, flags=re.IGNORECASE).strip('-_ ')
                     clean_name = ' '.join(re.sub(r'[-_]+', ' ', clean_name).split()).strip()
-                    clean_name = ' '.join(word.capitalize() for word in clean_name.split()) if clean_name else "Unnamed Livery" # English
+                    clean_name = ' '.join(word.capitalize() for word in clean_name.split()) if clean_name else "Unnamed Livery"
                     if clean_name:
                         self.custom_name_var.set(clean_name)
-                        self.log(f"Suggested livery name: {clean_name}", "DETAIL") # English
+                        self.log(f"Suggested livery name: {clean_name}", "DETAIL")
             else:
-                display_text = f"[{num_files} files selected]" # English
+                display_text = f"[{num_files} files selected]"
                 self.custom_name_var.set("")
                 self.custom_name_entry.config(state=tk.DISABLED)
-                self.log(f"{num_files} livery files selected.", "INFO") # English
+                self.log(f"{num_files} livery files selected.", "INFO")
             self.livery_zip_display_var.set(display_text)
         else:
             self.selected_zip_files = []
             self.livery_zip_display_var.set("")
             self.custom_name_entry.config(state=tk.NORMAL)
-            self.log("Livery file selection cancelled.", "DETAIL") # English
+            self.log("Livery file selection cancelled.", "DETAIL")
 
     def save_config(self):
         config = {
             "community_path": self.community_path_var.get(),
             "reference_path": self.reference_path_var.get(),
-            "pmdg_77er_path": self.pmdg_77er_path_var.get(),
-            "pmdg_77w_path": self.pmdg_77w_path_var.get(),
-            "pmdg_77f_path": self.pmdg_77f_path_var.get()
+            "pmdg_77er_path": self.pmdg_77er_path_var.get(), "pmdg_77w_path": self.pmdg_77w_path_var.get(), "pmdg_77f_path": self.pmdg_77f_path_var.get(),
+            "pmdg_736_path": self.pmdg_736_path_var.get(), "pmdg_737_path": self.pmdg_737_path_var.get(),
+            "pmdg_738_path": self.pmdg_738_path_var.get(), "pmdg_739_path": self.pmdg_739_path_var.get(),
         }
         try:
             config_dir = Path.home() / CONFIG_DIR_NAME
             config_dir.mkdir(parents=True, exist_ok=True)
             with open(config_dir / CONFIG_FILE_NAME, "w", encoding='utf-8') as f:
                 json.dump(config, f, indent=4)
-            self.log("Configuration saved successfully.", "SUCCESS") # English
-            self.status_var.set("Configuration saved") # English
-            self.master.after(2000, lambda: self.status_var.set("Ready")) # English
+            self.log("Configuration saved successfully.", "SUCCESS")
+            self.status_var.set("Configuration saved")
+            self.master.after(2000, lambda: self.status_var.set("Ready"))
         except Exception as e:
-            self.log(f"Error saving configuration: {str(e)}", "ERROR") # English
-            messagebox.showerror("Configuration Error", f"Could not save configuration:\n{e}") # English
+            self.log(f"Error saving configuration: {str(e)}", "ERROR")
+            messagebox.showerror("Configuration Error", f"Could not save configuration:\n{e}")
 
     def load_config(self):
         config_path = Path.home() / CONFIG_DIR_NAME / CONFIG_FILE_NAME
         if config_path.exists():
             try:
-                with open(config_path, "r", encoding='utf-8') as f: config = json.load(f)
-                self.community_path_var.set(config.get("community_path", ""))
-                self.reference_path_var.set(config.get("reference_path", ""))
-                self.pmdg_77er_path_var.set(config.get("pmdg_77er_path", ""))
-                self.pmdg_77w_path_var.set(config.get("pmdg_77w_path", ""))
-                self.pmdg_77f_path_var.set(config.get("pmdg_77f_path", ""))
-                self.log("Configuration loaded.", "INFO") # English
+                with open(config_path, "r", encoding='utf-8') as f: config_data = json.load(f)
+                self.community_path_var.set(config_data.get("community_path", ""))
+                self.reference_path_var.set(config_data.get("reference_path", ""))
+                self.pmdg_77er_path_var.set(config_data.get("pmdg_77er_path", ""))
+                self.pmdg_77w_path_var.set(config_data.get("pmdg_77w_path", ""))
+                self.pmdg_77f_path_var.set(config_data.get("pmdg_77f_path", ""))
+                self.pmdg_736_path_var.set(config_data.get("pmdg_736_path", ""))
+                self.pmdg_737_path_var.set(config_data.get("pmdg_737_path", ""))
+                self.pmdg_738_path_var.set(config_data.get("pmdg_738_path", ""))
+                self.pmdg_739_path_var.set(config_data.get("pmdg_739_path", ""))
+                self.log("Configuration loaded.", "INFO")
             except json.JSONDecodeError as e:
-                self.log(f"Error decoding configuration file: {e}. Please review or delete: {config_path}", "ERROR") # English
-                messagebox.showerror("Configuration Error", f"Could not load configuration (invalid JSON):\n{config_path}\nError: {e}") # English
+                self.log(f"Error decoding configuration file: {e}. Please review or delete: {config_path}", "ERROR")
+                messagebox.showerror("Configuration Error", f"Could not load configuration (invalid JSON):\n{config_path}\nError: {e}")
             except Exception as e:
-                self.log(f"Unknown error loading configuration: {e}", "WARNING") # English
+                self.log(f"Unknown error loading configuration: {e}", "WARNING")
         else:
-            self.log("Configuration file not found. Please configure paths in the Setup tab.", "INFO") # English
+            self.log("Configuration file not found. Please configure paths in the Setup tab.", "INFO")
 
     def get_livery_name(self, archive_path_or_folder: Path, temp_extract_dir: Path | None) -> str:
-        # temp_extract_dir is the folder where aircraft.cfg is expected after PTP reorg or ZIP extract
         if temp_extract_dir and temp_extract_dir.is_dir():
             try:
                 cfg_path_str = self.find_file_in_dir(temp_extract_dir, "aircraft.cfg")
@@ -624,103 +707,90 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
                         content = cfg_file.read()
                         fltsim_match = re.search(r'\[FLTSIM\.0\].*?title\s*=\s*"(.*?)"', content, re.DOTALL | re.IGNORECASE)
                         if fltsim_match and fltsim_match.group(1).strip():
-                            title = fltsim_match.group(1).strip()
-                            self.log(f"Name detected from aircraft.cfg [FLTSIM.0]: {title}", "INFO") # English
-                            return title
+                            return fltsim_match.group(1).strip()
                         simple_match = re.search(r'^\s*title\s*=\s*"(.*?)"', content, re.MULTILINE | re.IGNORECASE)
                         if simple_match and simple_match.group(1).strip():
-                            title = simple_match.group(1).strip()
-                            self.log(f"Name detected from aircraft.cfg (generic 'title='): {title}", "INFO") # English
-                            return title
-                else: self.log(f"aircraft.cfg not found in '{temp_extract_dir}' for name detection.", "DETAIL") # English
-            except Exception as e: self.log(f"Could not read aircraft.cfg for name detection from '{temp_extract_dir}': {e}", "WARNING") # English
+                            return simple_match.group(1).strip()
+            except Exception as e: self.log(f"Could not read aircraft.cfg for name detection: {e}", "WARNING")
         
         default_name = Path(archive_path_or_folder).stem
-        clean_name = re.sub(r'^(pmdg[-_]?)?(777[-_]?(200er|300er|f|w)?[-_]?)', '', default_name, flags=re.IGNORECASE).strip('-_ ')
+        clean_name = re.sub(r'^(pmdg[-_]?)?(777|737|736|738|739|bbj|bdsf|bcf|er|f|w)?([-_]?(200er|300er|f|w|600|700|800|900|bbj|bbj2|bdsf|bcf|er))?([-_]?)', '', default_name, flags=re.IGNORECASE).strip('-_ ')
         clean_name = ' '.join(re.sub(r'[-_]+', ' ', clean_name).split()).strip()
-        clean_name = ' '.join(word.capitalize() for word in clean_name.split()) if clean_name else "Unnamed Livery" # English
-        self.log(f"Using file/folder name '{default_name}' as basis for livery name: {clean_name}", "INFO") # English
-        return clean_name
+        return ' '.join(word.capitalize() for word in clean_name.split()) if clean_name else "Unnamed Livery"
 
     def extract_atc_id(self, cfg_path: Path) -> str | None:
-        if not cfg_path.is_file():
-            self.log(f"extract_atc_id: File not found: {cfg_path}", "WARNING") # English
-            return None
+        if not cfg_path.is_file(): return None
         try:
             with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as f: content = f.read()
             fltsim0_match = re.search(r'\[fltsim\.0\](.*?)(\n\s*\[|$)', content, re.DOTALL | re.IGNORECASE)
             if fltsim0_match:
                 section_content = fltsim0_match.group(1)
                 atc_id_match = re.search(r'^\s*atc_id\s*=\s*"?([a-zA-Z0-9_.\- ]+)"?', section_content, re.MULTILINE | re.IGNORECASE)
-                if atc_id_match:
+                if atc_id_match and atc_id_match.group(1).strip():
                     atc_id = atc_id_match.group(1).strip()
-                    if atc_id:
-                        safe_atc_id = re.sub(r'[\\/*?:"<>|]', '_', atc_id)
-                        if safe_atc_id != atc_id: self.log(f"ATC ID '{atc_id}' sanitized to '{safe_atc_id}' for filename.", "DETAIL") # English
-                        if not safe_atc_id: self.log(f"ATC ID '{atc_id}' became empty after sanitization.", "WARNING"); return None # English
-                        self.log(f"Found ATC ID in [fltsim.0]: '{safe_atc_id}'", "DETAIL") # English
-                        return safe_atc_id
-                    else: self.log("Found ATC ID in [fltsim.0] but it is empty.", "WARNING") # English
-                else: self.log("'atc_id=' line not found within [fltsim.0] section.", "WARNING") # English
-            else: self.log(f"[fltsim.0] section not found in {cfg_path.name}.", "WARNING") # English
-        except Exception as e: self.log(f"Error extracting ATC ID from {cfg_path}: {e}", "ERROR") # English
+                    safe_atc_id = re.sub(r'[\\/*?:"<>|]', '_', atc_id)
+                    if safe_atc_id: return safe_atc_id
+        except Exception as e: self.log(f"Error extracting ATC ID from {cfg_path}: {e}", "ERROR")
         return None
 
     def verify_settings(self) -> list[str]:
-        community_path = self.community_path_var.get()
-        reference_path = self.reference_path_var.get()
-        pmdg_paths_vars = {
-            "200ER": self.pmdg_77er_path_var.get(),
-            "300ER": self.pmdg_77w_path_var.get(),
-            "F": self.pmdg_77f_path_var.get()
-        }
-        livery_files_selected = self.selected_zip_files
-        aircraft_variant = self.aircraft_variant_var.get()
         errors = []
+        community_path = self.community_path_var.get()
+        if not community_path: errors.append("- MSFS Community Folder path not set.")
+        elif not Path(community_path).is_dir(): errors.append(f"- Community Folder not valid: {community_path}")
 
-        if not community_path: errors.append("- MSFS Community Folder path not set.") # English
-        elif not Path(community_path).is_dir(): errors.append(f"- Community Folder does not exist or is not a directory:\n  {community_path}") # English
+        reference_path = self.reference_path_var.get()
+        if not reference_path: errors.append("- Reference Livery Folder path not set.")
+        elif not Path(reference_path).is_dir(): errors.append(f"- Reference Livery Folder not valid: {reference_path}")
+        elif not (Path(reference_path) / "manifest.json").is_file() or not (Path(reference_path) / "layout.json").is_file():
+            errors.append(f"- Reference Livery Folder missing manifest.json or layout.json: {reference_path}")
 
-        for var_code, path_str, expected_name in [
-            ("200ER", pmdg_paths_vars["200ER"], "pmdg-aircraft-77er"),
-            ("300ER", pmdg_paths_vars["300ER"], "pmdg-aircraft-77w"),
-            ("F", pmdg_paths_vars["F"], "pmdg-aircraft-77f")
-        ]:
-            if not path_str: errors.append(f"- PMDG {var_code} Package Path (LocalState) not set.") # English
-            elif not Path(path_str).is_dir(): errors.append(f"- PMDG {var_code} Package Path (LocalState) is not a valid directory:\n  {path_str}") # English
-            elif Path(path_str).name.lower() != expected_name: errors.append(f"- PMDG {var_code} Package folder name should be '{expected_name}'.\n  Found: {Path(path_str).name}") # English
+        # CORRECCIÓN AQUÍ: Usar los nombres de paquete base correctos para los 737
+        pmdg_base_paths_to_check = {
+            "777-200ER": (self.pmdg_77er_path_var.get(), "pmdg-aircraft-77er"),
+            "777-300ER": (self.pmdg_77w_path_var.get(), "pmdg-aircraft-77w"),
+            "777F": (self.pmdg_77f_path_var.get(), "pmdg-aircraft-77f"),
+            "737-600": (self.pmdg_736_path_var.get(), "pmdg-aircraft-736"),  # CORREGIDO
+            "737-700 (Base)": (self.pmdg_737_path_var.get(), "pmdg-aircraft-737"),  # CORREGIDO
+            "737-800 (Base)": (self.pmdg_738_path_var.get(), "pmdg-aircraft-738"),  # CORREGIDO
+            "737-900 (Base)": (self.pmdg_739_path_var.get(), "pmdg-aircraft-739"),  # CORREGIDO
+        }
+        for label, (path_str, expected) in pmdg_base_paths_to_check.items(): # Renombrado el dict para claridad
+            if path_str: # Only validate if user has entered a path
+                if not Path(path_str).is_dir(): 
+                    errors.append(f"- PMDG {label} Path ('{path_str}') is not a valid directory.")
+                elif Path(path_str).name.lower() != expected: 
+                    errors.append(f"- PMDG {label} Path folder name should be '{expected}'. Found: {Path(path_str).name}")
+        
+        selected_variant = self.aircraft_variant_var.get()
+        if not selected_variant : 
+            errors.append("- Aircraft Variant for installation not selected.")
+        # La validación específica de que la ruta para el *selected_variant* esté configurada
+        # se hace de forma más directa en start_install_thread antes de iniciar la instalación.
+        # verify_settings se enfoca en la validez de las rutas que *están* configuradas.
 
-        if not reference_path: errors.append("- Reference Livery Folder path not set.") # English
-        elif not Path(reference_path).is_dir(): errors.append(f"- Reference Livery Folder does not exist or is not a directory:\n  {reference_path}") # English
-        elif not (Path(reference_path) / "manifest.json").is_file(): errors.append(f"- Reference Livery Folder is missing manifest.json:\n  {reference_path}") # English
-        elif not (Path(reference_path) / "layout.json").is_file(): errors.append(f"- Reference Livery Folder is missing layout.json:\n  {reference_path}") # English
-
-        if not aircraft_variant: errors.append("- You must select an Aircraft Variant.") # English
-
-        if not livery_files_selected:
-            errors.append("- No livery archive files (.zip or .ptp) selected.") # English
+        if not self.selected_zip_files: 
+            errors.append("- No livery archive files (.zip or .ptp) selected.")
         else:
-            contains_ptp = any(Path(f).suffix.lower() == ".ptp" for f in livery_files_selected) # Use Path for suffix
-            if contains_ptp and (not self.ptp_converter_exe or not os.path.exists(self.ptp_converter_exe)):
-                 errors.append(f"- A .ptp file was selected, but '{PTP_CONVERTER_EXE_NAME}' was not found.") # English
-                 errors.append(f"  Ensure '{PTP_CONVERTER_EXE_NAME}' is in the same folder as this application.") # English
-
-            for file_path_str in livery_files_selected:
-                file_p = Path(file_path_str) # Use a different variable name
-                if not file_p.is_file():
-                    errors.append(f"- Selected livery file does not exist:\n  {file_path_str}") # English
-                elif not (file_p.suffix.lower() in [".zip", ".ptp"]):
-                    errors.append(f"- File '{file_p.name}' is not a supported format (.zip or .ptp).") # English
+            if any(Path(f).suffix.lower() == ".ptp" for f in self.selected_zip_files) and \
+               (not self.ptp_converter_exe or not os.path.exists(self.ptp_converter_exe)):
+                errors.append(f"- A .ptp file selected, but '{PTP_CONVERTER_EXE_NAME}' was not found.")
+            for f_path_str in self.selected_zip_files:
+                f_p = Path(f_path_str)
+                if not f_p.is_file(): errors.append(f"- Selected livery file not found: {f_path_str}")
+                elif f_p.suffix.lower() not in [".zip", ".ptp"]: errors.append(f"- File '{f_p.name}' is not .zip or .ptp.")
         return errors
 
     def find_file_in_dir(self, directory: Path, filename_lower: str) -> str | None:
         """Recursively searches for a file (case-insensitive) in a directory."""
         search_path = Path(directory)
         if not search_path.is_dir():
-            self.log(f"find_file_in_dir: Provided directory does not exist or is invalid: {search_path}", "WARNING") # English
+            self.log(f"find_file_in_dir: Provided directory does not exist or is invalid: {search_path}", "WARNING")
             return None
             
         for root, dirs, files in os.walk(search_path):
+            # Exclude temp processing folders from search if any (though less likely here)
+            dirs[:] = [d for d in dirs if not d.startswith("__temp_")]
             for file_name in files:
                 if file_name.lower() == filename_lower:
                     return os.path.join(root, file_name)
@@ -730,14 +800,16 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
         """Recursively searches for a directory (case-insensitive) in a directory."""
         search_dir = Path(directory)
         if not search_dir.is_dir():
-            self.log(f"find_dir_in_dir: Provided directory does not exist or is invalid: {search_dir}", "WARNING") # English
+            self.log(f"find_dir_in_dir: Provided directory does not exist or is invalid: {search_dir}", "WARNING")
             return None
 
         for item in search_dir.iterdir(): # Check top level first
-            if item.is_dir() and item.name.lower() == dirname_lower:
+            if item.is_dir() and item.name.lower() == dirname_lower and not item.name.startswith("__temp_"):
                 return str(item)
         
         for root, dirs, files in os.walk(search_dir, topdown=True):
+            # Exclude temp processing folders from search
+            dirs[:] = [d for d in dirs if not d.startswith("__temp_")]
             for d_name in list(dirs): 
                 if d_name.lower() == dirname_lower:
                     found_path = Path(root) / d_name
@@ -750,33 +822,56 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
         texture_dirs = []
         search_dir = Path(directory)
         if not search_dir.is_dir():
-            self.log(f"find_texture_dirs_in_dir: Provided directory does not exist or is invalid: {search_dir}", "WARNING") # English
+            self.log(f"find_texture_dirs_in_dir: Provided directory does not exist or is invalid: {search_dir}", "WARNING")
             return []
             
         try:
-            for root_str, dirs, files in os.walk(search_dir): # os.walk yields str for root
+            for root_str, dirs, files in os.walk(search_dir):
+                # Exclude temp processing folders from search
+                dirs[:] = [d for d in dirs if not d.startswith("__temp_")]
                 root_path = Path(root_str)
-                for d_name in list(dirs): # Iterate over a copy of dirs to allow modification
+                for d_name in list(dirs): 
                     if d_name.lower().startswith("texture."):
                         full_path_str = str(root_path / d_name)
-                        if full_path_str not in texture_dirs: # Ensure uniqueness
+                        if full_path_str not in texture_dirs: 
                             texture_dirs.append(full_path_str)
-                        # Optional: dirs.remove(d_name) # To prevent descending into already found texture dirs
         except OSError as e:
-            self.log(f"Error traversing directory {search_dir} for texture folders: {e}", "WARNING") # English
+            self.log(f"Error traversing directory {search_dir} for texture folders: {e}", "WARNING")
         
         if not texture_dirs:
-             self.log(f"No 'texture.*' folders found in {directory}", "DETAIL") # English
+                self.log(f"No 'texture.*' folders found in {directory}", "DETAIL")
         return texture_dirs
 
     def start_install_thread(self):
         errors = self.verify_settings()
+        
+        selected_variant = self.aircraft_variant_var.get()
+        if selected_variant: # This check ensures a variant is selected before proceeding
+            required_base_pkg_path_str = ""
+            path_label_for_error = f"PMDG {selected_variant} Base Package Path" # Default error label
+
+            if selected_variant.startswith("777"):
+                if selected_variant == "777-200ER": required_base_pkg_path_str = self.pmdg_77er_path_var.get(); path_label_for_error = "777-200ER Path"
+                elif selected_variant == "777-300ER": required_base_pkg_path_str = self.pmdg_77w_path_var.get(); path_label_for_error = "777-300ER Path"
+                elif selected_variant == "777F": required_base_pkg_path_str = self.pmdg_77f_path_var.get(); path_label_for_error = "777F Path"
+            elif selected_variant.startswith("737"):
+                if "600" in selected_variant: required_base_pkg_path_str = self.pmdg_736_path_var.get(); path_label_for_error = "737-600 Path"
+                elif "700" in selected_variant: required_base_pkg_path_str = self.pmdg_737_path_var.get(); path_label_for_error = "737-700 (Base) Path"
+                elif "800" in selected_variant: required_base_pkg_path_str = self.pmdg_738_path_var.get(); path_label_for_error = "737-800 (Base) Path"
+                elif "900" in selected_variant: required_base_pkg_path_str = self.pmdg_739_path_var.get(); path_label_for_error = "737-900 (Base) Path"
+            
+            if not required_base_pkg_path_str:
+                errors.append(f"- The '{path_label_for_error}' in Setup tab is required for the selected '{selected_variant}' variant but is not set.")
+            elif not Path(required_base_pkg_path_str).is_dir():
+                 errors.append(f"- The '{path_label_for_error}' ('{required_base_pkg_path_str}') in Setup tab is not a valid directory.")
+
+
         if errors:
-            error_message = "Please correct the following configuration issues before installing:\n\n" + "\n".join(errors) # English
-            messagebox.showerror("Configuration Errors", error_message) # English
-            if any("Community" in e or "Reference" in e or "LocalState" in e or "Package" in e or PTP_CONVERTER_EXE_NAME in e for e in errors): # English keywords
+            error_message = "Please correct the following configuration issues before installing:\n\n" + "\n".join(errors)
+            messagebox.showerror("Configuration Errors", error_message)
+            if any("Community" in e or "Reference" in e or "LocalState" in e or "Package" in e or PTP_CONVERTER_EXE_NAME in e or "Path" in e or "Setup" in e for e in errors):
                 self.notebook.select(0) 
-            elif any("Variant" in e or "livery" in e for e in errors): # English keywords
+            elif any("Variant" in e or "livery" in e for e in errors): # Errors related to install tab selections
                 self.notebook.select(1) 
             return
 
@@ -784,869 +879,1405 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
         self.progress_var.set(0)
-        self.status_var.set("Starting installation...") # English
-        self.log("Starting installation process...", "STEP") # English
+        self.status_var.set("Starting installation...")
+        self.log("Starting installation process...", "STEP")
         self.install_button.config(state=tk.DISABLED)
         files_to_install = list(self.selected_zip_files) 
         install_thread = threading.Thread(target=self.install_livery_logic, args=(files_to_install,), daemon=True)
         install_thread.start()
 
     def _extract_archive(self, archive_path: Path, temp_dir: Path):
-        self.log(f"Extracting ZIP archive '{archive_path.name}' to {temp_dir}...", "INFO") # English
+        self.log(f"Extracting ZIP archive '{archive_path.name}' to {temp_dir}...", "INFO")
         if archive_path.suffix.lower() != ".zip":
-             raise ValueError(f"Unsupported file type for _extract_archive: {archive_path.name}. Only .zip.") # English
+                raise ValueError(f"Unsupported file type for _extract_archive: {archive_path.name}. Only .zip.")
         try:
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                MAX_PATH_COMPONENT_LEN = 240 # A more conservative check for individual components
+                MAX_PATH_COMPONENT_LEN = 240 
                 for member_info in zip_ref.infolist():
                     member_path_str = member_info.filename
-                    normalized_member_path = Path(member_path_str).as_posix()
-                    if normalized_member_path.startswith('/') or '/../' in normalized_member_path or normalized_member_path.endswith('/..'):
-                        raise ValueError(f"ZIP archive contains potentially unsafe path: {member_path_str}") # English
+                    normalized_member_path = Path(member_path_str).as_posix() 
+                    if normalized_member_path.startswith('/') or '/../' in normalized_member_path or normalized_member_path.endswith('/..') or ".." in normalized_member_path.split('/'):
+                        raise ValueError(f"ZIP archive contains potentially unsafe path: {member_path_str}")
                     if len(member_path_str) > MAX_PATH_COMPONENT_LEN : 
-                         self.log(f"Warning: Long path component in ZIP: '{member_path_str[:100]}...'", "WARNING") # English
+                            self.log(f"Warning: Long path component in ZIP: '{member_path_str[:100]}...'", "WARNING")
                 
                 zip_ref.extractall(temp_dir)
-            self.log(f"ZIP archive '{archive_path.name}' extracted successfully.", "SUCCESS") # English
+            self.log(f"ZIP archive '{archive_path.name}' extracted successfully.", "SUCCESS")
         except zipfile.BadZipFile:
-            raise ValueError(f"Invalid or corrupt ZIP archive: {archive_path.name}") # English
+            raise ValueError(f"Invalid or corrupt ZIP archive: {archive_path.name}")
         except (OSError, OverflowError) as e_os: 
-            if "path too long" in str(e_os).lower() or (hasattr(e_os, 'winerror') and e_os.winerror == 206): # ERROR_FILENAME_EXCED_RANGE
-                 raise RuntimeError(f"Failed to extract '{archive_path.name}': File path too long within ZIP - {e_os}") # English
-            raise RuntimeError(f"OS error extracting ZIP archive '{archive_path.name}': {e_os}") # English
+            if "path too long" in str(e_os).lower() or (hasattr(e_os, 'winerror') and e_os.winerror == 206):
+                    raise RuntimeError(f"Failed to extract '{archive_path.name}': File path too long within ZIP - {e_os}")
+            raise RuntimeError(f"OS error extracting ZIP archive '{archive_path.name}': {e_os}")
         except Exception as e:
-            raise RuntimeError(f"Failed to extract ZIP archive '{archive_path.name}': {e}") # English
+            raise RuntimeError(f"Failed to extract ZIP archive '{archive_path.name}': {e}")
 
-    def _run_ptp_converter(self, ptp_file_path: Path, ptp_processing_base_dir: Path) -> tuple[bool, Path | None]:
+    def _run_ptp_converter(self, ptp_file_to_process: Path, ptp_output_target_base_dir: Path) -> tuple[bool, Path | None, str]:
         if not self.ptp_converter_exe or not os.path.exists(self.ptp_converter_exe):
-            self.log(f"Error: {PTP_CONVERTER_EXE_NAME} not found. Cannot process {ptp_file_path.name}.", "ERROR") # English
-            return False, None
+            error_msg = f"Error: {PTP_CONVERTER_EXE_NAME} not found. Cannot process {ptp_file_to_process.name}."
+            self.log(error_msg, "ERROR")
+            return False, None, error_msg
 
-        self.log(f"Processing PTP file '{ptp_file_path.name}' using {Path(self.ptp_converter_exe).name}...", "INFO") # English
+        self.log(f"Processing PTP file '{ptp_file_to_process.name}' using {Path(self.ptp_converter_exe).name}...", "INFO")
+
+        converter_exe_dir = Path(self.ptp_converter_exe).parent
         
-        unique_ptp_output_folder_name = f"__ptp_extracted_{ptp_file_path.stem}_{datetime.now().strftime('%f')}"
-        target_controlled_temp_dir = ptp_processing_base_dir / unique_ptp_output_folder_name
+        # Directorio final (staging) donde el script de Python quiere el contenido final.
+        unique_final_content_folder_name = f"__ptp_staged_content_{ptp_file_to_process.stem}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        target_final_content_staging_dir = ptp_output_target_base_dir / unique_final_content_folder_name
         
-        original_ptp_file_parent_dir = ptp_file_path.parent
-        converter_native_output_dir = original_ptp_file_parent_dir / ptp_file_path.stem
+        # Directorio temporal para la copia del PTP (ruta corta)
+        temp_storage_for_ptp_copy_str = tempfile.mkdtemp(prefix="pmdg_ptp_input_")
+        temp_storage_for_ptp_copy_path = Path(temp_storage_for_ptp_copy_str)
         
+        temp_ptp_filename_for_processing = f"input_{datetime.now().strftime('%f')}.ptp"
+        absolute_path_to_copied_ptp = temp_storage_for_ptp_copy_path / temp_ptp_filename_for_processing
+        
+        # ESTA ES LA UBICACIÓN CORRECTA DE LA SALIDA NATIVA DEL CONVERTIDOR:
+        # En el mismo directorio que el PTP de entrada (copiado), con el stem del PTP de entrada.
+        converter_native_output_dir = absolute_path_to_copied_ptp.parent / absolute_path_to_copied_ptp.stem
+        
+        final_error_msg = ""
         try:
-            target_controlled_temp_dir.mkdir(parents=True, exist_ok=True)
-            
-            if converter_native_output_dir.exists():
-                self.log(f"Removing pre-existing PTP converter output folder: {converter_native_output_dir}", "DETAIL") # English
-                try: shutil.rmtree(converter_native_output_dir)
-                except Exception as e_rm:
-                    self.log(f"Could not remove pre-existing PTP output folder '{converter_native_output_dir}': {e_rm}. Attempting to continue.", "WARNING") # English
+            target_final_content_staging_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ptp_file_to_process, absolute_path_to_copied_ptp)
+            self.log(f"Copied '{ptp_file_to_process.name}' to temp location '{absolute_path_to_copied_ptp}' for processing.", "DETAIL")
 
-            self.log(f"Executing: \"{self.ptp_converter_exe}\" \"{ptp_file_path}\" (CWD: {original_ptp_file_parent_dir})", "CMD") # English
+            if converter_native_output_dir.exists(): # Limpiar salida nativa anterior si existe
+                shutil.rmtree(converter_native_output_dir)
+
+            # Ejecutar ptp_converter.exe. CWD es el directorio del .exe, se pasa la ruta absoluta al PTP.
+            self.log(f"Executing: \"{self.ptp_converter_exe}\" \"{str(absolute_path_to_copied_ptp)}\" (CWD: {str(converter_exe_dir)})", "CMD")
             process = subprocess.run(
-                [self.ptp_converter_exe, str(ptp_file_path)],
+                [self.ptp_converter_exe, str(absolute_path_to_copied_ptp)],
                 capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore',
-                cwd=str(original_ptp_file_parent_dir) 
+                cwd=str(converter_exe_dir) 
             )
 
-            if process.stdout: self.log(f"Output from {PTP_CONVERTER_EXE_NAME}:\n{process.stdout.strip()}", "DETAIL") # English
-            if process.stderr: self.log(f"Errors from {PTP_CONVERTER_EXE_NAME}:\n{process.stderr.strip()}", "WARNING" if process.returncode == 0 and process.stderr else "ERROR") # English
+            ptp_converter_stdout = process.stdout.strip() if process.stdout else ""
+            ptp_converter_stderr = process.stderr.strip() if process.stderr else ""
+
+            if ptp_converter_stdout: self.log(f"Output from {PTP_CONVERTER_EXE_NAME}:\n{ptp_converter_stdout}", "DETAIL")
+            
+            ptp_failed = False
+            tool_error_detected = ""
 
             if process.returncode != 0:
-                self.log(f"Execution of {PTP_CONVERTER_EXE_NAME} failed for '{ptp_file_path.name}'. Return code: {process.returncode}", "ERROR") # English
-                return False, None
+                tool_error_detected = f"PTP Converter exit code {process.returncode}."
+                ptp_failed = True
+            
+            # Verificar stdout en busca de errores conocidos, ya que ptp_converter.exe puede no usar códigos de salida correctamente.
+            if ptp_converter_stdout:
+                stdout_lower = ptp_converter_stdout.lower()
+                # Comprobar si "done!" NO está, Y hay un error, podría ser más fiable
+                if "error: system.applicationexception: cab extraction error" in stdout_lower or \
+                   "invalid parameters passed to extraction function" in stdout_lower:
+                    tool_error_detected = "PTP Converter: CAB extraction error (reported in stdout)."
+                    ptp_failed = True
+                elif "error:" in stdout_lower and "done!" not in stdout_lower and not tool_error_detected:
+                    tool_error_detected = "PTP Converter: Generic error (reported in stdout)."
+                    ptp_failed = True
+            
+            if ptp_converter_stderr:
+                stderr_lower = ptp_converter_stderr.lower()
+                if "error" in stderr_lower or "failed" in stderr_lower:
+                    if not tool_error_detected: tool_error_detected = "PTP Converter error (reported in stderr)."
+                    ptp_failed = True
+                if ptp_converter_stderr: # Loguear siempre si hay algo en stderr
+                    self.log(f"Stderr from {PTP_CONVERTER_EXE_NAME}:\n{ptp_converter_stderr}", 
+                             "ERROR" if (ptp_failed and ("error" in stderr_lower or "failed" in stderr_lower)) else "WARNING")
 
-            if not converter_native_output_dir.is_dir():
-                self.log(f"Expected extraction folder '{converter_native_output_dir}' was not created or is not a directory.", "ERROR") # English
-                return False, None
-
-            self.log(f"Moving extracted PTP content from '{converter_native_output_dir}' to '{target_controlled_temp_dir}'", "DETAIL") # English
+            # Después de que la herramienta se ejecute, verificar la carpeta de salida nativa ESPERADA
+            if not ptp_failed:
+                if not converter_native_output_dir.is_dir(): # AQUÍ ESTÁ LA VERIFICACIÓN CLAVE
+                    tool_error_detected = f"PTP Converter output folder '{converter_native_output_dir.name}' not created at expected location '{converter_native_output_dir}'."
+                    ptp_failed = True
+                elif not any(converter_native_output_dir.iterdir()):
+                    if "done!" not in ptp_converter_stdout.lower(): # Si dijo DONE pero está vacía, es raro pero no un error per se para esta comprobación
+                        tool_error_detected = f"PTP Converter output folder '{converter_native_output_dir.name}' is empty and tool did not report DONE."
+                        ptp_failed = True
+                    else:
+                         self.log(f"PTP Converter output folder '{converter_native_output_dir.name}' is empty, but tool reported DONE.", "DETAIL")
+            
+            if ptp_failed:
+                final_error_msg = f"PTP conversion FAILED for '{ptp_file_to_process.name}'. Detail: {tool_error_detected or 'Reason unknown from PTP tool output.'}"
+                self.log(final_error_msg, "ERROR")
+                return False, None, final_error_msg
+            
+            # Mover contenido desde converter_native_output_dir a target_final_content_staging_dir
+            self.log(f"Moving extracted content from '{converter_native_output_dir}' to final staging '{target_final_content_staging_dir}'", "DETAIL")
             moved_count = 0
-            for item_name in os.listdir(converter_native_output_dir):
-                source_item = converter_native_output_dir / item_name
-                destination_item = target_controlled_temp_dir / item_name
+            if converter_native_output_dir.exists() and any(converter_native_output_dir.iterdir()):
+                for item_name in os.listdir(converter_native_output_dir):
+                    source_item = converter_native_output_dir / item_name
+                    destination_item = target_final_content_staging_dir / item_name
+                    try:
+                        shutil.move(str(source_item), str(destination_item))
+                        moved_count += 1
+                    except Exception as e_move_item:
+                        error_moving = f"Failed to move item '{source_item.name}' from PTP native output: {e_move_item}"
+                        self.log(error_moving, "ERROR")
+                        return False, None, error_moving 
+            
+                if moved_count == 0 and any(converter_native_output_dir.iterdir()):
+                    error_no_move = f"No files were moved from PTP native output '{converter_native_output_dir}', but it was not empty."
+                    self.log(error_no_move, "WARNING")
+                    return False, None, error_no_move
+            else:
+                # Esto es normal si el PTP original estaba vacío y `ptp_converter.exe` lo manejó creando una carpeta vacía y dijo "DONE!"
+                self.log(f"PTP native output directory '{converter_native_output_dir}' is empty or does not exist, but tool reported success. Assuming empty PTP or already processed content.", "DETAIL")
+
+
+            self.log(f"PTP file '{ptp_file_to_process.name}' processed. Content staged in: {target_final_content_staging_dir}", "SUCCESS")
+            return True, target_final_content_staging_dir, ""
+
+        except Exception as e:
+            final_error_msg = f"CRITICAL error during _run_ptp_converter for '{ptp_file_to_process.name}': {e}"
+            self.log(final_error_msg, "ERROR")
+            import traceback
+            self.log(f"PTP Converter Exception Traceback: {traceback.format_exc()}", "DETAIL")
+            return False, None, final_error_msg
+        finally:
+            # Limpiar el directorio temporal donde se copió el PTP (esto también eliminará converter_native_output_dir si está dentro)
+            if temp_storage_for_ptp_copy_path.exists():
+                try:
+                    shutil.rmtree(temp_storage_for_ptp_copy_path)
+                    self.log(f"Cleaned up temp storage for PTP copy: {temp_storage_for_ptp_copy_path}", "DETAIL")
+                except Exception as e_clean_storage:
+                    self.log(f"Warning: Could not clean up temp storage '{temp_storage_for_ptp_copy_path}': {e_clean_storage}", "WARNING")
+            # La carpeta converter_native_output_in_exe_dir (si se creó en el dir del exe) ya no es el objetivo principal de salida.+
+
+        """
+        Procesa un archivo PTP. CWD se establece en el directorio del ptp_converter.exe.
+        El PTP se copia a una ruta temporal corta y se pasa como ruta absoluta.
+        Retorna: (éxito, ruta_al_contenido_final_procesado_del_ptp | None, mensaje_de_error_str)
+        """
+        if not self.ptp_converter_exe or not os.path.exists(self.ptp_converter_exe):
+            error_msg = f"Error: {PTP_CONVERTER_EXE_NAME} not found. Cannot process {ptp_file_to_process.name}."
+            self.log(error_msg, "ERROR")
+            return False, None, error_msg
+
+        self.log(f"Processing PTP file '{ptp_file_to_process.name}' using {Path(self.ptp_converter_exe).name}...", "INFO")
+
+        converter_exe_dir = Path(self.ptp_converter_exe).parent
+        unique_final_content_folder_name = f"__ptp_staged_content_{ptp_file_to_process.stem}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        target_final_content_staging_dir = ptp_output_target_base_dir / unique_final_content_folder_name
+        
+        # Directorio temporal para la copia del PTP (ruta corta)
+        temp_storage_for_ptp_copy_str = tempfile.mkdtemp(prefix="pmdg_ptp_input_")
+        temp_storage_for_ptp_copy_path = Path(temp_storage_for_ptp_copy_str)
+        
+        # Nombre temporal sin espacios para el archivo PTP copiado
+        temp_ptp_filename_for_processing = f"input_{datetime.now().strftime('%f')}.ptp"
+        absolute_path_to_copied_ptp = temp_storage_for_ptp_copy_path / temp_ptp_filename_for_processing
+        
+        # El convertidor, si CWD es su propio directorio, creará la carpeta de salida allí.
+        # Ej: _MEIxxxx/input_123456 (donde input_123456 es el stem del PTP temporal)
+        temp_ptp_stem_for_processing = absolute_path_to_copied_ptp.stem 
+        converter_native_output_in_exe_dir = converter_exe_dir / temp_ptp_stem_for_processing
+        
+        final_error_msg = ""
+
+        try:
+            target_final_content_staging_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ptp_file_to_process, absolute_path_to_copied_ptp)
+            self.log(f"Copied '{ptp_file_to_process.name}' to temp location '{absolute_path_to_copied_ptp}' for processing.", "DETAIL")
+
+            if converter_native_output_in_exe_dir.exists(): # Limpiar salida nativa anterior si existe
+                shutil.rmtree(converter_native_output_in_exe_dir)
+
+            self.log(f"Executing: \"{self.ptp_converter_exe}\" \"{str(absolute_path_to_copied_ptp)}\" (CWD: {str(converter_exe_dir)})", "CMD")
+            process = subprocess.run(
+                [self.ptp_converter_exe, str(absolute_path_to_copied_ptp)], # Ruta absoluta al PTP copiado
+                capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore',
+                cwd=str(converter_exe_dir) # Establecer CWD al directorio del ejecutable
+            )
+
+            ptp_converter_stdout = process.stdout.strip() if process.stdout else ""
+            ptp_converter_stderr = process.stderr.strip() if process.stderr else ""
+
+            if ptp_converter_stdout: self.log(f"Output from {PTP_CONVERTER_EXE_NAME}:\n{ptp_converter_stdout}", "DETAIL")
+            
+            ptp_failed = False
+            tool_error_detected = ""
+
+            if process.returncode != 0:
+                tool_error_detected = f"PTP Converter exit code {process.returncode}."
+                ptp_failed = True
+            
+            if ptp_converter_stdout:
+                stdout_lower = ptp_converter_stdout.lower()
+                if "error: system.applicationexception: cab extraction error" in stdout_lower or \
+                   "invalid parameters passed to extraction function" in stdout_lower:
+                    tool_error_detected = "PTP Converter: CAB extraction error (stdout)."
+                    ptp_failed = True
+                elif "error:" in stdout_lower and not tool_error_detected :
+                    tool_error_detected = "PTP Converter: Generic error (stdout)."
+                    ptp_failed = True
+
+            if ptp_converter_stderr:
+                stderr_lower = ptp_converter_stderr.lower()
+                if "error" in stderr_lower or "failed" in stderr_lower:
+                    if not tool_error_detected: tool_error_detected = "PTP Converter error (stderr)."
+                    ptp_failed = True
+                self.log(f"Stderr from {PTP_CONVERTER_EXE_NAME}:\n{ptp_converter_stderr}", 
+                         "ERROR" if tool_error_detected and "error" in stderr_lower else "WARNING") # Log con más contexto
+
+            # Después de que la herramienta se ejecute (o falle), verificar la carpeta de salida nativa
+            if not ptp_failed:
+                if not converter_native_output_in_exe_dir.is_dir():
+                    tool_error_detected = f"PTP Converter output folder '{converter_native_output_in_exe_dir.name}' not created in its CWD."
+                    ptp_failed = True
+                elif not any(converter_native_output_in_exe_dir.iterdir()):
+                    tool_error_detected = f"PTP Converter output folder '{converter_native_output_in_exe_dir.name}' is empty."
+                    ptp_failed = True
+            
+            if ptp_failed:
+                final_error_msg = f"PTP conversion FAILED for '{ptp_file_to_process.name}'. Detail: {tool_error_detected or 'Reason unknown from PTP tool output.'}"
+                self.log(final_error_msg, "ERROR")
+                return False, None, final_error_msg
+            
+            # Mover contenido desde la salida nativa del convertidor (en converter_exe_dir) a target_final_content_staging_dir
+            self.log(f"Moving extracted PTP content from '{converter_native_output_in_exe_dir}' to final staging '{target_final_content_staging_dir}'", "DETAIL")
+            moved_count = 0
+            for item_name in os.listdir(converter_native_output_in_exe_dir):
+                source_item = converter_native_output_in_exe_dir / item_name
+                destination_item = target_final_content_staging_dir / item_name
                 try:
                     shutil.move(str(source_item), str(destination_item))
-                    moved_count +=1
-                except Exception as e_move:
-                    self.log(f"Failed to move '{source_item.name}', attempting copy: {e_move}", "WARNING") # English
-                    try:
-                        if source_item.is_dir(): shutil.copytree(source_item, destination_item, dirs_exist_ok=True)
-                        else: shutil.copy2(source_item, destination_item)
-                        if source_item.is_dir(): shutil.rmtree(source_item)
-                        else: source_item.unlink()
-                        moved_count +=1
-                    except Exception as e_copy_fb:
-                         self.log(f"Fallback copy also failed for '{source_item.name}': {e_copy_fb}", "ERROR") # English
-                         raise
+                    moved_count += 1
+                except Exception as e_move_item:
+                    error_moving = f"Failed to move item '{source_item.name}' from PTP native output: {e_move_item}"
+                    self.log(error_moving, "ERROR")
+                    # Si un ítem no se puede mover, es un fallo crítico para este PTP
+                    return False, None, error_moving
             
-            if moved_count > 0:
-                 self.log(f"PTP content moved/copied. Removing original extraction container '{converter_native_output_dir}'.", "DETAIL") # English
-                 try: shutil.rmtree(converter_native_output_dir) 
-                 except Exception as e_rm_orig: self.log(f"Could not remove original PTP extraction folder '{converter_native_output_dir}': {e_rm_orig}", "WARNING") # English
-            else:
-                 self.log(f"Warning: No files were moved/copied from '{converter_native_output_dir}'. Was it empty?", "WARNING") # English
+            if moved_count == 0 and any(converter_native_output_in_exe_dir.iterdir()):
+                error_no_move = f"No files were moved from PTP native output '{converter_native_output_in_exe_dir}', but it was not empty."
+                self.log(error_no_move, "WARNING")
+                return False, None, error_no_move
 
-            self.log(f"PTP file '{ptp_file_path.name}' processed successfully. Content prepared in: {target_controlled_temp_dir}", "SUCCESS") # English
-            return True, target_controlled_temp_dir
+            self.log(f"PTP file '{ptp_file_to_process.name}' processed. Content staged in: {target_final_content_staging_dir}", "SUCCESS")
+            return True, target_final_content_staging_dir, ""
+
         except Exception as e:
-            self.log(f"CRITICAL error during PTP processing for '{ptp_file_path.name}': {e}", "ERROR") # English
+            final_error_msg = f"CRITICAL error during _run_ptp_converter for '{ptp_file_to_process.name}': {e}"
+            self.log(final_error_msg, "ERROR")
             import traceback
-            self.log(f"PTP Traceback: {traceback.format_exc()}", "DETAIL") # English
-            if target_controlled_temp_dir.exists(): # Clean up our controlled temp dir
-                try: shutil.rmtree(target_controlled_temp_dir)
-                except Exception as e_clean: self.log(f"Error cleaning up PTP temp folder '{target_controlled_temp_dir}' on failure: {e_clean}", "WARNING") # English
-            if 'converter_native_output_dir' in locals() and converter_native_output_dir.exists():
-                 try: shutil.rmtree(converter_native_output_dir)
-                 except Exception as e_clean_native: self.log(f"Error cleaning converter's native output '{converter_native_output_dir}' on PTP failure: {e_clean_native}", "WARNING") # English
-            return False, None
+            self.log(f"PTP Converter Exception Traceback: {traceback.format_exc()}", "DETAIL")
+            return False, None, final_error_msg
+        finally:
+            # Limpiar el directorio temporal donde se copió el PTP
+            if temp_storage_for_ptp_copy_path.exists():
+                try:
+                    shutil.rmtree(temp_storage_for_ptp_copy_path)
+                    self.log(f"Cleaned up temp storage for PTP copy: {temp_storage_for_ptp_copy_path}", "DETAIL")
+                except Exception as e_clean_storage:
+                    self.log(f"Warning: Could not clean up temp storage '{temp_storage_for_ptp_copy_path}': {e_clean_storage}", "WARNING")
+            
+            # Limpiar la carpeta de salida nativa del convertidor SI AÚN EXISTE Y ESTÁ VACÍA
+            # (si los archivos se movieron correctamente, debería estar vacía o no existir)
+            if converter_native_output_in_exe_dir.exists():
+                try:
+                    if not any(converter_native_output_in_exe_dir.iterdir()): # Solo si está vacía
+                        converter_native_output_in_exe_dir.rmdir()
+                        self.log(f"Cleaned up empty native output dir in converter's CWD: {converter_native_output_in_exe_dir}", "DETAIL")
+                except Exception as e_clean_native:
+                    self.log(f"Warning: Could not remove converter native output dir '{converter_native_output_in_exe_dir}': {e_clean_native}", "WARNING")
 
     def _reorganize_ptp_output(self, ptp_content_folder: Path) -> tuple[bool, str]:
-        self.log(f"Reorganizing extracted PTP content in: {ptp_content_folder}", "STEP") # English
+        self.log(f"Reorganizing extracted PTP content from: {ptp_content_folder}", "STEP")
+        # This function standardizes the structure of a PTP-extracted livery
+        # to match what a typical ZIP livery might look like (aircraft.cfg, model folder, texture folders at root).
         try:
             config_cfg_original_path = ptp_content_folder / "Config.cfg"
-            aircraft_cfg_final_path = ptp_content_folder / "aircraft.cfg"
-            original_cfg_content_lines = []
+            aircraft_cfg_target_path = ptp_content_folder / "aircraft.cfg"
+            original_cfg_lines = []
 
             if config_cfg_original_path.is_file():
-                self.log(f"Reading '{config_cfg_original_path.name}'...", "DETAIL") # English
-                with open(config_cfg_original_path, 'r', encoding='utf-8', errors='ignore') as f: original_cfg_content_lines = f.readlines()
-            elif aircraft_cfg_final_path.is_file():
-                self.log(f"'{aircraft_cfg_final_path.name}' already exists. Processing its content.", "DETAIL") # English
-                with open(aircraft_cfg_final_path, 'r', encoding='utf-8', errors='ignore') as f: original_cfg_content_lines = f.readlines()
+                self.log(f"Reading PTP's '{config_cfg_original_path.name}' for aircraft.cfg conversion.", "DETAIL")
+                with open(config_cfg_original_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    original_cfg_lines = f.readlines()
+            elif aircraft_cfg_target_path.is_file():
+                self.log(f"'{aircraft_cfg_target_path.name}' already exists in PTP output. Using as base.", "DETAIL")
+                with open(aircraft_cfg_target_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    original_cfg_lines = f.readlines()
             else:
-                return False, f"Neither Config.cfg nor aircraft.cfg found in '{ptp_content_folder}'." # English
+                return False, f"PTP Error: Neither Config.cfg nor aircraft.cfg found in '{ptp_content_folder}'."
 
-            if not original_cfg_content_lines: return False, "PTP configuration file is empty or could not be read." # English
+            if not original_cfg_lines:
+                return False, "PTP Error: Configuration file (Config.cfg or aircraft.cfg) is empty."
 
-            model_value_from_ptp_cfg = ""
-            for line in original_cfg_content_lines:
-                cleaned_line = line.strip().lower()
-                if cleaned_line.startswith("model="):
-                    model_value_from_ptp_cfg = line.split('=', 1)[1].strip().strip('"')
-                    self.log(f"Detected original 'model={model_value_from_ptp_cfg}' in PTP config.", "DETAIL") # English
-                    break 
+            model_value_in_ptp_cfg = ""
+            for line in original_cfg_lines:
+                if line.strip().lower().startswith("model="):
+                    model_value_in_ptp_cfg = line.split('=', 1)[1].strip().strip('"')
+                    self.log(f"Found 'model={model_value_in_ptp_cfg}' in PTP config.", "DETAIL")
+                    break
             
-            model_cfg_src_path = ptp_content_folder / "model.cfg"
-            if model_cfg_src_path.is_file():
-                target_model_folder_name = "model" 
-                if model_value_from_ptp_cfg:
-                    target_model_folder_name = f"model.{model_value_from_ptp_cfg}"
-                model_folder_final_dest = ptp_content_folder / target_model_folder_name
-                model_folder_final_dest.mkdir(exist_ok=True)
-                target_model_cfg_final_path = model_folder_final_dest / "model.cfg"
-                self.log(f"Moving '{model_cfg_src_path.name}' to '{target_model_cfg_final_path}'", "DETAIL") # English
-                shutil.move(str(model_cfg_src_path), str(target_model_cfg_final_path))
-            else: self.log("model.cfg not found in PTP output. Skipping model folder creation.", "DETAIL") # English
+            # Handle model.cfg: PMDG PTPs often have model.cfg at the root.
+            # Standard liveries expect it inside a "model" or "model.XXX" folder.
+            ptp_model_cfg_path = ptp_content_folder / "model.cfg"
+            if ptp_model_cfg_path.is_file():
+                model_folder_name = "model"
+                if model_value_in_ptp_cfg: # If Config.cfg specified model=XXX, use model.XXX
+                    model_folder_name = f"model.{model_value_in_ptp_cfg}"
+                
+                target_model_dir = ptp_content_folder / model_folder_name
+                target_model_dir.mkdir(exist_ok=True)
+                final_model_cfg_path = target_model_dir / "model.cfg"
+                
+                self.log(f"Moving PTP's root 'model.cfg' to '{final_model_cfg_path}'.", "DETAIL")
+                shutil.move(str(ptp_model_cfg_path), str(final_model_cfg_path))
 
-            processed_lines_for_aircraft_cfg = []
-            fltsim_header_normalized = False
-            for line_content in original_cfg_content_lines:
-                if not fltsim_header_normalized and line_content.strip().lower().startswith("[fltsim."):
-                    normalized_header = re.sub(r'\[fltsim\.[^\]]*\]', '[fltsim.0]', line_content.strip(), count=1, flags=re.IGNORECASE)
-                    line_ending = '\r\n' if line_content.endswith('\r\n') else '\n'
-                    processed_lines_for_aircraft_cfg.append(normalized_header + line_ending)
-                    if line_content.strip().lower() != normalized_header.lower():
-                        self.log(f"Normalized header '{line_content.strip()}' to '{normalized_header}'.", "DETAIL") # English
-                    fltsim_header_normalized = True
+            # Prepare aircraft.cfg content (from Config.cfg if it existed)
+            new_aircraft_cfg_lines = []
+            fltsim0_header_found = False
+            for line in original_cfg_lines:
+                stripped_line_lower = line.strip().lower()
+                if stripped_line_lower.startswith("[fltsim."): # Normalize to [fltsim.0]
+                    eol = '\r\n' if line.endswith('\r\n') else '\n'
+                    new_aircraft_cfg_lines.append(f"[fltsim.0]{eol}")
+                    if stripped_line_lower != "[fltsim.0]":
+                         self.log(f"Normalized PTP config header '{line.strip()}' to '[fltsim.0]'.", "DETAIL")
+                    fltsim0_header_found = True
                 else:
-                    processed_lines_for_aircraft_cfg.append(line_content)
+                    new_aircraft_cfg_lines.append(line)
             
-            final_cfg_body_str = "".join(processed_lines_for_aircraft_cfg)
-            if not fltsim_header_normalized:
-                 self.log("WARNING: No [fltsim.x] type section found/normalized in PTP config file.", "WARNING") # English
+            if not fltsim0_header_found and new_aircraft_cfg_lines: # If no [fltsim.X] but content exists
+                self.log("Warning: No [fltsim.X] section found in PTP config. Prepending [fltsim.0]. Livery might need manual check.", "WARNING")
+                eol = '\r\n' if new_aircraft_cfg_lines[0].endswith('\r\n') else '\n'
+                new_aircraft_cfg_lines.insert(0, f"[fltsim.0]{eol}")
 
-            if not final_cfg_body_str.lstrip().lower().startswith("[version]"):
-                final_cfg_content_to_write = "[VERSION]\nmajor=1\nminor=0\n\n" + final_cfg_body_str
-                self.log("[VERSION] section prepended to aircraft.cfg content.", "DETAIL") # English
-            else:
-                final_cfg_content_to_write = final_cfg_body_str
-                self.log("aircraft.cfg content already started with [VERSION].", "DETAIL") # English
-            
-            with open(aircraft_cfg_final_path, 'w', encoding='utf-8', newline='') as f_write:
-                f_write.write(final_cfg_content_to_write)
-            self.log(f"'{aircraft_cfg_final_path.name}' saved. (Original 'model=' line preserved: 'model={model_value_from_ptp_cfg}')", "SUCCESS") # English
-            
-            if config_cfg_original_path.is_file() and config_cfg_original_path.resolve() != aircraft_cfg_final_path.resolve():
-                try: config_cfg_original_path.unlink(); self.log(f"Original '{config_cfg_original_path.name}' deleted.", "DETAIL") # English
-                except OSError as e: self.log(f"Warning: Could not delete original '{config_cfg_original_path.name}': {e}", "WARNING") # English
 
-            (ptp_content_folder / "Settings.dat").unlink(missing_ok=True)
-            self.log("Attempted deletion of 'Settings.dat' (if it existed).", "DETAIL") # English
-            
-            aircraft_ini = ptp_content_folder / "Aircraft.ini"
-            options_ini = ptp_content_folder / "options.ini"
-            if aircraft_ini.is_file():
-                aircraft_ini.rename(options_ini)
-                self.log(f"Renamed '{aircraft_ini.name}' to '{options_ini.name}'.", "DETAIL") # English
-            elif options_ini.is_file(): self.log("'options.ini' already exists.", "DETAIL") # English
-            else: self.log("Neither 'Aircraft.ini' nor 'options.ini' found in PTP output.", "DETAIL") # English
+            # Ensure [VERSION] section
+            final_cfg_str = "".join(new_aircraft_cfg_lines)
+            if not final_cfg_str.lstrip().lower().startswith("[version]"):
+                final_cfg_str = "[VERSION]\nmajor=1\nminor=0\n\n" + final_cfg_str
+                self.log("Prepended [VERSION] section to the aircraft.cfg from PTP.", "DETAIL")
 
-            self.log("PTP content reorganization (dynamic model folder naming) completed successfully.", "SUCCESS") # English
+            with open(aircraft_cfg_target_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(final_cfg_str)
+            self.log(f"Final 'aircraft.cfg' created/updated in PTP staging area: {aircraft_cfg_target_path}", "SUCCESS")
+
+            if config_cfg_original_path.is_file() and config_cfg_original_path != aircraft_cfg_target_path :
+                try: config_cfg_original_path.unlink(); self.log(f"Deleted original PTP '{config_cfg_original_path.name}'.", "DETAIL")
+                except OSError as e: self.log(f"Could not delete PTP '{config_cfg_original_path.name}': {e}", "WARNING")
+            
+            # Handle Aircraft.ini -> options.ini (for consistency with ZIPs)
+            ptp_aircraft_ini = ptp_content_folder / "Aircraft.ini"
+            target_options_ini = ptp_content_folder / "options.ini"
+            if ptp_aircraft_ini.is_file():
+                if target_options_ini.exists():
+                    self.log(f"Warning: Both '{ptp_aircraft_ini.name}' and '{target_options_ini.name}' exist in PTP output. Overwriting options.ini.", "WARNING")
+                    target_options_ini.unlink()
+                ptp_aircraft_ini.rename(target_options_ini)
+                self.log(f"Renamed PTP's '{ptp_aircraft_ini.name}' to '{target_options_ini.name}'.", "DETAIL")
+            
+            # Delete other PTP-specific files not needed for standard livery structure
+            files_to_delete_from_ptp = ["Settings.dat", " Manifest.ini", "Product.ini"] # Note leading space in Manifest.ini sometimes
+            for f_name in files_to_delete_from_ptp:
+                file_path = ptp_content_folder / f_name.strip() # Use strip for safety
+                if file_path.is_file():
+                    try: file_path.unlink(); self.log(f"Deleted PTP-specific file: '{file_path.name}'", "DETAIL")
+                    except OSError as e: self.log(f"Could not delete PTP file '{file_path.name}': {e}", "WARNING")
+            
+            self.log("PTP output reorganization successful.", "SUCCESS")
             return True, ""
         except Exception as e:
-            self.log(f"CRITICAL error during PTP reorganization in '{ptp_content_folder}': {e}", "ERROR") # English
+            self.log(f"Error during PTP output reorganization for '{ptp_content_folder}': {e}", "ERROR")
             import traceback
-            self.log(f"PTP Reorganization Traceback: {traceback.format_exc()}", "DETAIL") # English
-            return False, f"Critical error in PTP reorganization: {e}" # English
+            self.log(f"Traceback: {traceback.format_exc()}", "DETAIL")
+            return False, str(e)
 
     def _is_nested_archive(self, directory: Path) -> bool:
-        zip_count = 0
-        ptp_count = 0 # Added for PTP detection
-        other_file_folder_count = 0
-        has_texture_folder = False
+        # (Implementation from previous response, seems okay, ensure __temp_ checks are robust)
+        zip_count = 0; ptp_count = 0; other_file_folder_count = 0
+        has_texture_folder = False; has_aircraft_cfg = False
         check_dir = directory
         try:
             items = list(check_dir.iterdir())
-            if len(items) == 1 and items[0].is_dir() and not items[0].name.startswith(('.', '__MACOSX')):
+            if len(items) == 1 and items[0].is_dir() and not items[0].name.startswith(('.', '__MACOSX', '__temp_')):
                 check_dir = items[0]
             
             for item in check_dir.iterdir():
-                if item.name.startswith(('.', '__MACOSX')): continue
+                if item.name.startswith(('.', '__MACOSX', '__temp_')): continue
                 if item.is_file():
                     if item.suffix.lower() == '.zip': zip_count += 1
-                    elif item.suffix.lower() == '.ptp': ptp_count += 1 # Count PTPs
+                    elif item.suffix.lower() == '.ptp': ptp_count += 1
+                    elif item.name.lower() == 'aircraft.cfg': has_aircraft_cfg = True; other_file_folder_count +=1
                     else: other_file_folder_count += 1
                 elif item.is_dir():
                     other_file_folder_count += 1
                     if item.name.lower().startswith('texture.'): has_texture_folder = True
         except OSError as e:
-            self.log(f"Error checking directory for nested archives in '{check_dir}': {e}", "WARNING") # English
-            return False
+            self.log(f"Error checking for nested archives in '{check_dir}': {e}", "WARNING"); return False
         
         archive_file_count = zip_count + ptp_count
-        is_nested = (archive_file_count > 0 and not has_texture_folder) or \
-                    (archive_file_count > 0 and other_file_folder_count <= 2)
-        
-        if is_nested:
-            self.log(f"Nested archive structure detected in '{check_dir.name}'. ZIPs: {zip_count}, PTPs: {ptp_count}, Others: {other_file_folder_count}, HasTexture: {has_texture_folder}.", "INFO") # English
-        return is_nested
+        if has_texture_folder or has_aircraft_cfg: is_nested = False
+        elif archive_file_count > 0 and other_file_folder_count <= 2 : is_nested = True
+        elif archive_file_count > 0 : is_nested = True
+        else: is_nested = False
 
+        if is_nested: self.log(f"Nested archive detected in '{check_dir.name}'.", "INFO")
+        return is_nested
+    
     def _process_single_livery(self,
                                extracted_livery_source_path: Path,
-                               original_archive_path: Path,
-                               common_config: dict
+                               original_archive_path: Path, # This is the path to the .zip or .ptp file being processed (or sub-PTP)
+                               common_config: dict,
+                               specific_livery_name: str | None = None # Name from PTP settings for sub-liveries
                                ) -> tuple[bool, str]:
         """
         Processes a single prepared livery from 'extracted_livery_source_path'.
         Copies files to the final destination, modifies aircraft.cfg, handles .ini.
-        Attempts to clean up its own created destination folder on failure.
+        'extracted_livery_source_path' is the root of the prepared livery content.
+        'common_config' holds paths and aircraft variant info.
+        'specific_livery_name' is used for sub-liveries from multi-PTPs, overriding other name detection.
         """
         livery_success = False
-        processing_error_detail = "Unknown error during individual livery processing." # English
-        livery_display_name = "Unknown Livery" # English
+        processing_error_detail = "Unknown error during individual livery processing."
+        livery_display_name = "Unknown Livery" # Default
         final_livery_dest_path: Path | None = None
 
         try:
-            livery_display_name = self.get_livery_name(original_archive_path, extracted_livery_source_path)
-            sanitized_fs_foldername = re.sub(r'[\\/*?:"<>|]', '_', livery_display_name).strip()
-            if not sanitized_fs_foldername:
-                sanitized_fs_foldername = f"Unnamed_{original_archive_path.stem}"
-                self.log(f"Sanitized livery name was empty, using '{sanitized_fs_foldername}'.", "WARNING") # English
+            # --- Determine the livery display name ---
+            if specific_livery_name:
+                livery_display_name = specific_livery_name
+                # original_archive_path.name here would be like "Texture.1.PTP" or the nested ZIP name
+                self.log(f"Using specific name: '{livery_display_name}' (from PTP settings/nested archive for content of '{original_archive_path.name}')", "INFO")
+            # Check if this is the single, top-level archive selected by the user AND a custom name is provided in the UI
+            elif len(self.selected_zip_files) == 1 and Path(self.selected_zip_files[0]) == original_archive_path and self.custom_name_var.get():
+                livery_display_name = self.custom_name_var.get()
+                self.log(f"Using user-provided custom name: '{livery_display_name}' for the single selected archive: {original_archive_path.name}", "INFO")
+            else:
+                # Fallback for:
+                # - Multiple top-level archives selected by the user.
+                # - A single top-level archive selected, but no custom name provided.
+                # - Nested ZIP archives (that are not sub-PTPs handled by specific_livery_name).
+                livery_display_name = self.get_livery_name(original_archive_path, extracted_livery_source_path)
+                self.log(f"Auto-detected/generated name: '{livery_display_name}' for {original_archive_path.name}", "INFO")
 
-            final_livery_dest_path = common_config['main_package_folder'] / "SimObjects" / "Airplanes" / \
-                                     f"{common_config['base_aircraft_folder_name']} {sanitized_fs_foldername}"
-            self.log(f"Final livery destination folder: {final_livery_dest_path}", "DETAIL") # English
+            sanitized_fs_foldername_suffix = re.sub(r'[\\/*?:"<>|]', '_', livery_display_name).strip().replace('.', '_')
+            if not sanitized_fs_foldername_suffix:
+                sanitized_fs_foldername_suffix = f"UnnamedLivery_{original_archive_path.stem}_{datetime.now().strftime('%S%f')}"
+                self.log(f"Sanitized livery name was empty, using generated folder suffix: '{sanitized_fs_foldername_suffix}'.", "WARNING")
+
+            # Construct the final destination path for this specific livery
+            final_livery_folder_name_in_simobjects = f"{common_config['base_aircraft_folder_name']} {sanitized_fs_foldername_suffix}"
+            final_livery_dest_path = common_config['main_package_folder'] / "SimObjects" / "Airplanes" / final_livery_folder_name_in_simobjects
+            
+            self.log(f"Final livery destination folder: {final_livery_dest_path}", "DETAIL")
 
             if final_livery_dest_path.exists():
-                self.log(f"Destination folder already exists. Overwriting: {final_livery_dest_path}", "WARNING") # English
+                self.log(f"Destination folder '{final_livery_dest_path.name}' already exists. Overwriting...", "WARNING")
                 try:
                     shutil.rmtree(final_livery_dest_path)
-                    self.log(f"Existing destination folder deleted.", "DETAIL") # English
-                    time.sleep(0.1)
+                    self.log(f"Existing destination folder deleted.", "DETAIL")
+                    time.sleep(0.1) # Brief pause to allow filesystem to catch up
                 except OSError as e:
-                    if sys.platform == "win32" and isinstance(e, PermissionError):
-                        raise RuntimeError(f"Failed to delete existing folder '{final_livery_dest_path}'. Is MSFS or File Explorer using it?") # English
-                    else:
-                        raise RuntimeError(f"Failed to delete existing livery folder '{final_livery_dest_path}': {e}.") # English
+                    raise RuntimeError(f"Failed to delete existing livery folder '{final_livery_dest_path}': {e}. Check if MSFS or File Explorer is using it.")
             
             final_livery_dest_path.mkdir(parents=True, exist_ok=True)
-            self.log("Final livery destination folder created/cleaned.", "SUCCESS") # English
+            self.log(f"Final livery destination folder created: {final_livery_dest_path.name}", "SUCCESS")
 
-            self.log(f"Copying files from processed source: {extracted_livery_source_path}", "INFO") # English
+            self.log(f"Copying files from prepared source: {extracted_livery_source_path} to {final_livery_dest_path.name}", "INFO")
 
+            # --- Locate and copy aircraft.cfg ---
             aircraft_cfg_source_str = self.find_file_in_dir(extracted_livery_source_path, "aircraft.cfg")
-            if not aircraft_cfg_source_str:
-                raise FileNotFoundError(f"aircraft.cfg not found in processed source folder '{extracted_livery_source_path}'.") # English
+            if not aircraft_cfg_source_str or not Path(aircraft_cfg_source_str).is_file():
+                # Check one level deeper, common in simple zips: LiveryName/aircraft.cfg
+                if extracted_livery_source_path.is_dir():
+                    for item in extracted_livery_source_path.iterdir():
+                        if item.is_dir() and not item.name.startswith(('.', '__MACOSX', '__temp_')): # Avoid special/temp folders
+                            cfg_in_sub = self.find_file_in_dir(item, "aircraft.cfg")
+                            if cfg_in_sub:
+                                aircraft_cfg_source_str = cfg_in_sub
+                                self.log(f"Found aircraft.cfg in subfolder: {item.name}", "DETAIL")
+                                break
+                if not aircraft_cfg_source_str:            
+                    raise FileNotFoundError(f"aircraft.cfg not found in processed source '{extracted_livery_source_path}' or its direct subfolders.")
+            
             aircraft_cfg_source_path = Path(aircraft_cfg_source_str)
             aircraft_cfg_final_target_path = final_livery_dest_path / "aircraft.cfg"
             shutil.copy2(aircraft_cfg_source_path, aircraft_cfg_final_target_path)
-            self.log(f"Copied '{aircraft_cfg_source_path.name}' to '{aircraft_cfg_final_target_path}'.", "DETAIL") # English
+            self.log(f"Copied '{aircraft_cfg_source_path.name}' to '{aircraft_cfg_final_target_path}'.", "DETAIL")
             
+            # The directory containing the aircraft.cfg is considered the root of the livery content
+            effective_content_source_dir = aircraft_cfg_source_path.parent
+
+            # --- Copy model folder(s) ---
             model_folder_copied = False
-            for item in extracted_livery_source_path.iterdir():
+            for item in effective_content_source_dir.iterdir():
                 if item.is_dir() and item.name.lower().startswith("model"):
                     model_src_path = item
-                    model_dest_path = final_livery_dest_path / model_src_path.name
-                    self.log(f"Copying model folder '{model_src_path.name}' to '{model_dest_path}'...", "DETAIL") # English
+                    model_dest_path = final_livery_dest_path / model_src_path.name # Preserve original model folder name (e.g., model.XXX)
+                    self.log(f"Copying model folder '{model_src_path.name}' to '{model_dest_path}'...", "DETAIL")
                     shutil.copytree(model_src_path, model_dest_path, dirs_exist_ok=True)
-                    model_folder_copied = True
-                    break 
+                    model_folder_copied = True 
             if not model_folder_copied:
-                self.log("Model folder (or 'model.XXX') not found in source. This may be normal.", "DETAIL") # English
+                self.log("No 'model.*' folder found in source. This is okay if model is shared or defined differently.", "DETAIL")
 
-            texture_dirs_source_str_list = self.find_texture_dirs_in_dir(extracted_livery_source_path)
+            # --- Copy texture folder(s) ---
+            texture_dirs_source_str_list = self.find_texture_dirs_in_dir(effective_content_source_dir)
             if not texture_dirs_source_str_list:
-                raise FileNotFoundError(f"'texture.*' folders not found in processed source folder '{extracted_livery_source_path}'.") # English
-            for tex_dir_src_str in texture_dirs_source_str_list:
-                tex_dir_src_path = Path(tex_dir_src_str)
-                tex_dir_dest_path = final_livery_dest_path / tex_dir_src_path.name
-                shutil.copytree(tex_dir_src_path, tex_dir_dest_path, dirs_exist_ok=True)
-                self.log(f"Copied texture folder '{tex_dir_src_path.name}' to '{tex_dir_dest_path}'.", "DETAIL") # English
+                self.log(f"Warning: No 'texture.*' folders found in processed source content directory '{effective_content_source_dir}'. Livery may not appear correctly.", "WARNING")
+            else:
+                for tex_dir_src_str in texture_dirs_source_str_list:
+                    tex_dir_src_path = Path(tex_dir_src_str)
+                    tex_dir_dest_path = final_livery_dest_path / tex_dir_src_path.name # Preserve original texture folder name
+                    shutil.copytree(tex_dir_src_path, tex_dir_dest_path, dirs_exist_ok=True)
+                    self.log(f"Copied texture folder '{tex_dir_src_path.name}' to '{tex_dir_dest_path}'.", "DETAIL")
             
+            # --- Copy other relevant files (e.g. panel.cfg, sound.cfg if they exist at the same level as aircraft.cfg) ---
             copied_extras_count = 0
-            source_config_parent_dir = aircraft_cfg_source_path.parent 
-            atc_id_for_exclusion = self.extract_atc_id(aircraft_cfg_final_target_path)
+            atc_id_for_ini_handling = self.extract_atc_id(aircraft_cfg_final_target_path) # Get ATC ID from the *copied* aircraft.cfg
+            
+            # Define files that are typically handled separately or are part of the core structure already copied
             files_to_exclude_lc = {"aircraft.cfg", "options.ini", "layout.json", "manifest.json", 
-                                   "config.cfg", "aircraft.ini", "settings.dat", "model.cfg"}
-            if atc_id_for_exclusion:
-                files_to_exclude_lc.add(f"{atc_id_for_exclusion}.ini".lower())
+                                   "config.cfg", "aircraft.ini", "settings.dat", "model.cfg"} # PTP specific files
+            if atc_id_for_ini_handling: # If an ATC ID was found, also exclude its potential .ini name
+                files_to_exclude_lc.add(f"{atc_id_for_ini_handling}.ini".lower())
 
-            for item_name in os.listdir(source_config_parent_dir):
-                item_src_full_path = source_config_parent_dir / item_name
+            for item_name in os.listdir(effective_content_source_dir):
+                item_src_full_path = effective_content_source_dir / item_name
+                
+                # Skip already processed/irrelevant directories and specific files
                 if item_src_full_path.is_dir() and (item_name.lower().startswith("model") or item_name.lower().startswith("texture.")):
                     continue 
                 if item_src_full_path.is_file() and item_name.lower() in files_to_exclude_lc:
                     continue 
+                
                 if item_src_full_path.is_file():
-                    if item_src_full_path.suffix.lower() in ['.json', '.ini', '.cfg', '.xml', '.dat', '.txt', '.flags', '.ttf', '.otf']:
+                    # Copy common config/data/font files if present.
+                    common_extensions = ['.cfg', '.xml', '.dat', '.txt', '.flags', '.ttf', '.otf', '.ini', '.sound', '.air', '.flt', '.fdm']
+                    # Check if it's not one of the already excluded .ini files by name
+                    is_potentially_options_ini = item_name.lower() == "options.ini"
+                    is_potentially_atc_id_ini = atc_id_for_ini_handling and item_name.lower() == f"{atc_id_for_ini_handling}.ini"
+
+                    if item_src_full_path.suffix.lower() in common_extensions and not is_potentially_options_ini and not is_potentially_atc_id_ini:
                         item_dest_full_path = final_livery_dest_path / item_name
                         try:
                             shutil.copy2(item_src_full_path, item_dest_full_path)
+                            self.log(f"Copied extra file '{item_name}' to '{final_livery_dest_path.name}'.", "DETAIL")
                             copied_extras_count += 1
                         except Exception as e_copy_ex:
-                            self.log(f"Could not copy extra file '{item_name}': {e_copy_ex}", "WARNING") # English
-            if copied_extras_count > 0: self.log(f"Copied {copied_extras_count} additional extra files.", "DETAIL") # English
-            self.log("Essential livery file copying complete.", "SUCCESS") # English
+                            self.log(f"Could not copy extra file '{item_name}': {e_copy_ex}", "WARNING")
+            if copied_extras_count > 0: self.log(f"Copied {copied_extras_count} additional relevant file(s).", "DETAIL")
+            self.log("Essential livery file copying complete.", "SUCCESS")
 
-            self.log("Processing options.ini...", "INFO") # English
-            atc_id_from_final_cfg = self.extract_atc_id(aircraft_cfg_final_target_path)
-            options_ini_in_source_str = self.find_file_in_dir(extracted_livery_source_path, "options.ini")
+            # --- Process .ini file for LocalState ---
+            self.log("Processing .ini file for LocalState...", "INFO")
             source_ini_to_copy_path: Path | None = None
             target_ini_name_in_localstate: str | None = None
             ini_file_found_in_source = False
             ini_copied_to_localstate = False
 
-            if atc_id_from_final_cfg:
-                target_ini_name_in_localstate = f"{atc_id_from_final_cfg}.ini"
+            if atc_id_for_ini_handling: # ATC ID must be known to name the .ini file correctly
+                target_ini_name_in_localstate = f"{atc_id_for_ini_handling}.ini"
+                
+                # Prefer "options.ini" if present in the source livery structure
+                options_ini_in_source_str = self.find_file_in_dir(effective_content_source_dir, "options.ini")
                 if options_ini_in_source_str and Path(options_ini_in_source_str).is_file():
                     source_ini_to_copy_path = Path(options_ini_in_source_str)
                     ini_file_found_in_source = True
-                    self.log(f"Found '{source_ini_to_copy_path.name}' in processed source.", "DETAIL") # English
+                    self.log(f"Found '{source_ini_to_copy_path.name}' in source.", "DETAIL")
                 else: 
-                    atc_id_ini_in_source_str = self.find_file_in_dir(extracted_livery_source_path, target_ini_name_in_localstate.lower())
+                    # If no "options.ini", check if an .ini file already named with ATC_ID exists
+                    atc_id_ini_in_source_str = self.find_file_in_dir(effective_content_source_dir, target_ini_name_in_localstate.lower())
                     if atc_id_ini_in_source_str and Path(atc_id_ini_in_source_str).is_file():
                         source_ini_to_copy_path = Path(atc_id_ini_in_source_str)
                         ini_file_found_in_source = True
-                        self.log(f"Found '{source_ini_to_copy_path.name}' (pre-named) in processed source.", "DETAIL") # English
+                        self.log(f"Found pre-named '{source_ini_to_copy_path.name}' in source.", "DETAIL")
             
             if ini_file_found_in_source and source_ini_to_copy_path and target_ini_name_in_localstate:
-                pmdg_ls_pkg_path = common_config['pmdg_localstate_package_path']
+                pmdg_ls_pkg_path = common_config['pmdg_localstate_package_path'] # Path to pmdg-aircraft-737, etc. in LocalState
                 if pmdg_ls_pkg_path.is_dir():
                     target_ini_storage_dir = pmdg_ls_pkg_path / "work" / "Aircraft"
-                    target_ini_final_path = target_ini_storage_dir / target_ini_name_in_localstate
+                    target_ini_final_path_in_localstate = target_ini_storage_dir / target_ini_name_in_localstate
                     try:
                         target_ini_storage_dir.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(source_ini_to_copy_path, target_ini_final_path)
-                        self.log(f"INI file '{source_ini_to_copy_path.name}' copied as '{target_ini_name_in_localstate}' to: {target_ini_storage_dir}", "SUCCESS") # English
+                        shutil.copy2(source_ini_to_copy_path, target_ini_final_path_in_localstate)
+                        self.log(f"INI file '{source_ini_to_copy_path.name}' copied as '{target_ini_name_in_localstate}' to: {target_ini_storage_dir}", "SUCCESS")
                         ini_copied_to_localstate = True
                     except Exception as e_cp_ini:
-                        self.log(f"Failed to copy INI file '{source_ini_to_copy_path.name}' to '{target_ini_final_path}': {e_cp_ini}", "ERROR") # English
+                        self.log(f"Failed to copy INI '{source_ini_to_copy_path.name}' to '{target_ini_final_path_in_localstate}': {e_cp_ini}", "ERROR")
                 else:
-                    self.log(f"PMDG LocalState Package Path for {common_config['aircraft_variant']} is invalid: {pmdg_ls_pkg_path}. Cannot copy INI file.", "ERROR") # English
-            elif atc_id_from_final_cfg: 
-                self.log(f"Neither 'options.ini' nor '{atc_id_from_final_cfg}.ini' found in processed source folder to copy to LocalState.", "DETAIL") # English
-            else: 
-                self.log("Valid ATC ID not found in aircraft.cfg; cannot process .ini file for LocalState.", "WARNING") # English
+                    self.log(f"PMDG LocalState Package Path for '{common_config['aircraft_variant']}' is invalid: {pmdg_ls_pkg_path}. Cannot copy INI.", "ERROR")
+            elif atc_id_for_ini_handling: # An ATC ID was found, but no suitable .ini file
+                self.log(f"Neither 'options.ini' nor '{atc_id_for_ini_handling}.ini' found in source '{effective_content_source_dir}'. No INI copied to LocalState.", "DETAIL")
+            else: # No ATC ID found in aircraft.cfg
+                self.log("ATC ID not found in aircraft.cfg; cannot process .ini for LocalState.", "WARNING")
 
-            self.log(f"Modifying aircraft.cfg in final destination: {aircraft_cfg_final_target_path}...", "INFO") # English
-            self.modify_aircraft_cfg(aircraft_cfg_final_target_path, common_config['aircraft_variant'], livery_display_name)
+            # --- Modify aircraft.cfg in the final destination ---
+            self.log(f"Modifying aircraft.cfg at: {aircraft_cfg_final_target_path}...", "INFO")
+            self.modify_aircraft_cfg(aircraft_cfg_final_target_path, 
+                                     common_config['aircraft_variant'], 
+                                     livery_display_name) # Pass the determined livery_display_name
 
             livery_success = True
-            processing_error_detail = "Installed successfully." # English
-            if ini_file_found_in_source and not ini_copied_to_localstate and atc_id_from_final_cfg:
-                ini_name_msg = source_ini_to_copy_path.name if source_ini_to_copy_path else "INI file" # English
-                processing_error_detail += f" (Warning: {ini_name_msg} found but failed to copy to LocalState)" # English
+            processing_error_detail = f"Installed successfully as '{livery_display_name}'."
+            if ini_file_found_in_source and not ini_copied_to_localstate and atc_id_for_ini_handling:
+                ini_name_msg = source_ini_to_copy_path.name if source_ini_to_copy_path else "INI file"
+                processing_error_detail += f" (Warning: {ini_name_msg} found but failed to copy to LocalState)"
 
         except (FileNotFoundError, ValueError, RuntimeError, OSError) as e_proc:
             processing_error_detail = str(e_proc)
-            self.log(f"LIVERY PROCESSING FAILED ({livery_display_name} from {original_archive_path.name}): {processing_error_detail}", "ERROR") # English
+            # Log the name that was being processed when the error occurred
+            current_name_for_log = specific_livery_name or livery_display_name or original_archive_path.name
+            self.log(f"LIVERY PROCESSING FAILED ({current_name_for_log}): {processing_error_detail}", "ERROR")
         except Exception as e_unexp: 
-            processing_error_detail = f"Unexpected error processing livery {livery_display_name} (from {original_archive_path.name}): {str(e_unexp)}" # English
-            self.log(f"FATAL LIVERY ERROR ({livery_display_name}): {processing_error_detail}", "ERROR") # English
+            current_name_for_log = specific_livery_name or livery_display_name or original_archive_path.name
+            processing_error_detail = f"Unexpected error processing livery {current_name_for_log}: {str(e_unexp)}"
+            self.log(f"FATAL LIVERY ERROR ({current_name_for_log}): {processing_error_detail}", "ERROR")
             import traceback 
             self.log(f"Traceback _process_single_livery: {traceback.format_exc()}", "DETAIL")
         
+        # --- Cleanup on failure ---
         if not livery_success and final_livery_dest_path and final_livery_dest_path.exists():
-            self.log(f"Failure in _process_single_livery for '{livery_display_name}'. Attempting to remove created destination folder: {final_livery_dest_path}", "WARNING") # English
+            self.log(f"Cleaning up failed livery folder: {final_livery_dest_path}", "WARNING")
             try:
                 shutil.rmtree(final_livery_dest_path)
-                self.log(f"Destination folder of failed livery removed: {final_livery_dest_path}", "INFO") # English
+                self.log(f"Destination folder of failed livery removed: {final_livery_dest_path.name}", "INFO")
             except Exception as e_cleanup:
-                self.log(f"Error attempting to remove destination folder of failed livery '{final_livery_dest_path}': {e_cleanup}", "ERROR") # English
+                self.log(f"Error removing failed livery folder '{final_livery_dest_path.name}': {e_cleanup}", "ERROR")
         
         return livery_success, processing_error_detail
 
+    def _process_extracted_ptp_content(self,
+                                       initial_ptp_extract_path: Path, # This is the folder where the top-level PTP's content was staged
+                                       original_top_level_ptp_path: Path, # Path to the original .ptp file user selected (or nested PTP)
+                                       common_config: dict,
+                                       results_summary_list: list[dict],
+                                       batch_success_counter: list[int], 
+                                       batch_failure_flag_for_archive: list[bool]
+                                       ) -> None:
+        """
+        Processes the content extracted from a PTP archive.
+        Determines if it's a single livery PTP or a multi-livery PTP (based on Settings.dat)
+        and processes accordingly.
+        For multi-livery PTPs, it iterates through sub-PTPs, runs ptp_converter on them, 
+        reorganizes their output, and then calls _process_single_livery for each.
+        For single-livery PTPs, it reorganizes the output and calls _process_single_livery.
+
+        Args:
+            initial_ptp_extract_path: The path where the content of 'original_top_level_ptp_path'
+                                      was extracted by _run_ptp_converter.
+            original_top_level_ptp_path: The Path object of the PTP file whose content is in
+                                         'initial_ptp_extract_path'. Used for logging and context.
+            common_config: Dictionary with common installation paths and settings.
+            results_summary_list: List to append individual livery processing results.
+            batch_success_counter: Mutable list [count] to increment for successful liveries.
+            batch_failure_flag_for_archive: Mutable list [flag] to set if any part of this
+                                            PTP's processing fails.
+        """
+        self.log(f"Examining PTP content from '{original_top_level_ptp_path.name}' in: {initial_ptp_extract_path}", "DETAIL")
+        settings_dat_path = initial_ptp_extract_path / "Settings.dat"
+        is_multi_livery_ptp = False
+        sub_livery_ptp_files_info = []  # List of tuples (ptp_filename_str, descriptive_name_str)
+
+        if settings_dat_path.is_file():
+            self.log(f"Found Settings.dat: {settings_dat_path}", "INFO")
+            parser = configparser.ConfigParser(interpolation=None, strict=False, allow_no_value=True)
+            try:
+                settings_content = settings_dat_path.read_text(encoding='utf-8', errors='ignore')
+                if not settings_content.strip().startswith("["):
+                    self.log("Settings.dat doesn't start with a section, prepending [Settings] for parser.", "DETAIL")
+                    settings_content = "[Settings]\n" + settings_content
+                
+                parser.read_string(settings_content)
+
+                if parser.has_section("Settings") and parser.has_option("Settings", "Type"):
+                    ptp_type = parser.get("Settings", "Type", fallback="").strip().lower()
+                    if ptp_type == "multi livery":
+                        is_multi_livery_ptp = True
+                        count = parser.getint("Settings", "Count", fallback=0)
+                        self.log(f"Detected 'Multi Livery' PTP ('{original_top_level_ptp_path.name}') with {count} sub-liveries.", "INFO")
+                        for i in range(1, count + 1):
+                            section_name = f"Livery {i}"
+                            if parser.has_section(section_name) and parser.has_option(section_name, "Filename"):
+                                filename = parser.get(section_name, "Filename")
+                                # Use the descriptive "Name" from Settings.dat for the specific_livery_name
+                                name_from_settings = parser.get(section_name, "Name", fallback=filename) 
+                                sub_livery_ptp_files_info.append((filename, name_from_settings))
+                            else:
+                                self.log(f"Warning: Section '{section_name}' missing or 'Filename' option not found in Settings.dat for '{original_top_level_ptp_path.name}'.", "WARNING")
+                                batch_failure_flag_for_archive[0] = True 
+                                # Add a failure entry for the main PTP if its structure is faulty
+                                if not any(r["file"] == original_top_level_ptp_path.name and "Settings.dat malformed" in r["detail"] for r in results_summary_list):
+                                     results_summary_list.append({
+                                        "file": original_top_level_ptp_path.name,
+                                        "success": False,
+                                        "detail": f"Settings.dat malformed or incomplete (section {section_name})."
+                                    })
+                    else:
+                        self.log(f"Settings.dat Type is '{ptp_type}' for '{original_top_level_ptp_path.name}', processing as single PTP structure.", "INFO")
+                else:
+                    self.log(f"Settings.dat for '{original_top_level_ptp_path.name}' does not have [Settings] section or Type option, assuming single PTP structure.", "INFO")
+            except configparser.Error as e_cfg:
+                self.log(f"Error parsing Settings.dat ({settings_dat_path}): {e_cfg}. Assuming single PTP structure for '{original_top_level_ptp_path.name}'.", "WARNING")
+            except Exception as e_set: # Catch any other exception during Settings.dat processing
+                self.log(f"Unexpected error reading Settings.dat ({settings_dat_path}): {e_set}. Assuming single PTP structure for '{original_top_level_ptp_path.name}'.", "WARNING")
+
+        if is_multi_livery_ptp and sub_livery_ptp_files_info:
+            self.log(f"Processing {len(sub_livery_ptp_files_info)} sub-liveries from '{original_top_level_ptp_path.name}'.", "INFO")
+            for ptp_filename_in_archive, livery_name_from_settings in sub_livery_ptp_files_info:
+                # This is the actual .PTP file for the sub-livery, located within the extracted top-level PTP content
+                sub_ptp_file_to_process = initial_ptp_extract_path / ptp_filename_in_archive
+                
+                # For logging, show the hierarchy: MainPTP -> DescriptiveSubLiveryName (SubPTP Filename)
+                display_name_for_log_and_summary = f"{original_top_level_ptp_path.name} -> {livery_name_from_settings} ({ptp_filename_in_archive})"
+
+                if not sub_ptp_file_to_process.is_file():
+                    self.log(f"Sub-PTP file '{ptp_filename_in_archive}' not found at '{sub_ptp_file_to_process}'. Skipping.", "ERROR")
+                    results_summary_list.append({
+                        "file": display_name_for_log_and_summary,
+                        "success": False,
+                        "detail": f"Sub-PTP file '{ptp_filename_in_archive}' not found within '{original_top_level_ptp_path.name}'."
+                    })
+                    batch_failure_flag_for_archive[0] = True
+                    continue
+
+                self.log(f"--- Processing Sub-PTP: {display_name_for_log_and_summary} ---", "STEP")
+                
+                # Create a unique temporary directory for this sub-PTP's own extraction process
+                # This directory will be a sub-directory of initial_ptp_extract_path (where the top-level PTP was extracted)
+                nested_temp_sub_ptp_processing_dir = initial_ptp_extract_path / f"__sub_ptp_proc_{sub_ptp_file_to_process.stem}_{datetime.now().strftime('%f')}"
+                
+                try:
+                    nested_temp_sub_ptp_processing_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Run ptp_converter on the sub-PTP file (e.g., Texture.1.PTP)
+                    # The output will be staged into a unique folder within nested_temp_sub_ptp_processing_dir
+                    conv_ok_sub, extracted_sub_ptp_content_folder, ptp_conv_err_msg_sub = self._run_ptp_converter(
+                        sub_ptp_file_to_process,       # The actual sub-PTP file (e.g., Texture.1.PTP)
+                        nested_temp_sub_ptp_processing_dir # Base dir for this sub-PTP's staged output
+                    )
+                    if not conv_ok_sub:
+                        error_detail_sub = ptp_conv_err_msg_sub if ptp_conv_err_msg_sub else f"Conversion failed for sub-PTP: {ptp_filename_in_archive}"
+                        raise RuntimeError(error_detail_sub)
+
+                    # Reorganize the content of the extracted sub-PTP
+                    reorg_ok_sub, reorg_msg_sub = self._reorganize_ptp_output(extracted_sub_ptp_content_folder)
+                    if not reorg_ok_sub:
+                        raise RuntimeError(f"Reorganization failed for sub-PTP '{ptp_filename_in_archive}': {reorg_msg_sub}")
+
+                    # Now, process this reorganized sub-livery
+                    # IMPORTANT: Pass livery_name_from_settings as specific_livery_name
+                    livery_ok, detail = self._process_single_livery(
+                        extracted_sub_ptp_content_folder, # Path to the reorganized content of the sub-PTP
+                        sub_ptp_file_to_process,          # Original path of the sub-PTP file (for context in _process_single_livery)
+                        common_config,
+                        specific_livery_name=livery_name_from_settings # THIS IS THE KEY CHANGE
+                    )
+                    results_summary_list.append({
+                        "file": display_name_for_log_and_summary, # Use the detailed name for summary
+                        "success": livery_ok,
+                        "detail": detail
+                    })
+                    if livery_ok:
+                        batch_success_counter[0] += 1
+                    else:
+                        batch_failure_flag_for_archive[0] = True
+
+                except Exception as e_sub_proc:
+                    self.log(f"ERROR processing sub-PTP '{display_name_for_log_and_summary}': {e_sub_proc}", "ERROR")
+                    results_summary_list.append({
+                        "file": display_name_for_log_and_summary,
+                        "success": False,
+                        "detail": str(e_sub_proc)
+                    })
+                    batch_failure_flag_for_archive[0] = True
+                # nested_temp_sub_ptp_processing_dir and its contents (like extracted_sub_ptp_content_folder)
+                # will be cleaned up when initial_ptp_extract_path is removed by the calling function's finally block.
+        
+        else: # This is a single PTP structure (or Settings.dat was missing/unparsable as multi)
+            self.log(f"Processing '{original_top_level_ptp_path.name}' as a single PTP structure.", "INFO")
+            try:
+                # Reorganize the initially extracted content of the top-level PTP
+                reorg_ok, reorg_msg = self._reorganize_ptp_output(initial_ptp_extract_path)
+                if not reorg_ok:
+                    raise RuntimeError(f"PTP reorganization failed for '{original_top_level_ptp_path.name}': {reorg_msg}")
+                
+                # Process as a single livery. specific_livery_name is None here, so _process_single_livery
+                # will use UI custom name (if single file selected) or auto-detect from original_top_level_ptp_path.
+                livery_ok, detail = self._process_single_livery(
+                    initial_ptp_extract_path, # Path to the reorganized content of the single/top-level PTP
+                    original_top_level_ptp_path,
+                    common_config,
+                    specific_livery_name=None # Explicitly None for single PTPs
+                )
+                results_summary_list.append({
+                    "file": original_top_level_ptp_path.name, # Use the PTP's own name for summary
+                    "success": livery_ok,
+                    "detail": detail
+                })
+                if livery_ok:
+                    batch_success_counter[0] += 1
+                else:
+                    batch_failure_flag_for_archive[0] = True
+            except Exception as e_single_ptp_proc:
+                self.log(f"ERROR processing single PTP structure from '{original_top_level_ptp_path.name}': {e_single_ptp_proc}", "ERROR")
+                results_summary_list.append({
+                    "file": original_top_level_ptp_path.name,
+                    "success": False,
+                    "detail": str(e_single_ptp_proc)
+                })
+                batch_failure_flag_for_archive[0] = True
+
     def install_livery_logic(self, archive_paths_to_process: list[str]):
         num_files_initial = len(archive_paths_to_process)
-        total_archives_processed = 0
-        successful_liveries_installed = 0
-        failed_liveries_or_archives = 0
+        total_archives_processed_count = 0
+        successful_liveries_installed_count_ref = [0] # Passed by reference to updating functions
+        failed_top_level_archives_count = 0 # Counts top-level archives that had one or more errors
+
         results_summary: list[dict] = []
 
+        # --- Common Configuration Setup ---
         try:
             community_path = Path(self.community_path_var.get())
             reference_livery_path = Path(self.reference_path_var.get())
-            pmdg_variant_paths = {
-                "200ER": Path(self.pmdg_77er_path_var.get()),
-                "300ER": Path(self.pmdg_77w_path_var.get()),
-                "F": Path(self.pmdg_77f_path_var.get())
-            }
-            current_aircraft_variant = self.aircraft_variant_var.get()
-            pmdg_localstate_for_variant = pmdg_variant_paths.get(current_aircraft_variant)
+            selected_variant_for_install = self.aircraft_variant_var.get()
 
-            if not pmdg_localstate_for_variant or not pmdg_localstate_for_variant.is_dir():
-                raise ValueError(f"PMDG Package Path (LocalState) for variant '{current_aircraft_variant}' is invalid or not set.") # English
+            pmdg_localstate_base_package_path_str = ""
+            if selected_variant_for_install.startswith("777"):
+                if selected_variant_for_install == "777-200ER": pmdg_localstate_base_package_path_str = self.pmdg_77er_path_var.get()
+                elif selected_variant_for_install == "777-300ER": pmdg_localstate_base_package_path_str = self.pmdg_77w_path_var.get()
+                elif selected_variant_for_install == "777F": pmdg_localstate_base_package_path_str = self.pmdg_77f_path_var.get()
+            elif selected_variant_for_install.startswith("737"):
+                if "600" in selected_variant_for_install: pmdg_localstate_base_package_path_str = self.pmdg_736_path_var.get()
+                elif "700" in selected_variant_for_install: pmdg_localstate_base_package_path_str = self.pmdg_737_path_var.get()
+                elif "800" in selected_variant_for_install: pmdg_localstate_base_package_path_str = self.pmdg_738_path_var.get()
+                elif "900" in selected_variant_for_install: pmdg_localstate_base_package_path_str = self.pmdg_739_path_var.get()
 
-            target_package_name = VARIANT_PACKAGE_MAP.get(current_aircraft_variant)
-            if not target_package_name: raise ValueError(f"Package mapping not found for variant: {current_aircraft_variant}") # English
-            target_package_root_path = community_path / target_package_name
+            if not pmdg_localstate_base_package_path_str:
+                raise ValueError(f"PMDG Base Package Path for '{selected_variant_for_install}' is not set in Setup.")
+            pmdg_localstate_for_variant_base_pkg = Path(pmdg_localstate_base_package_path_str)
+            if not pmdg_localstate_for_variant_base_pkg.is_dir():
+                raise ValueError(f"PMDG Base Package Path for '{selected_variant_for_install}' ('{pmdg_localstate_for_variant_base_pkg}') is not a valid directory.")
+
+            target_community_package_name = VARIANT_PACKAGE_MAP.get(selected_variant_for_install)
+            if not target_community_package_name:
+                raise ValueError(f"Community package mapping missing for variant: {selected_variant_for_install}")
+            target_community_package_root_path = community_path / target_community_package_name
             
-            base_simobject_pmdg_folder_name = VARIANT_BASE_AIRCRAFT_MAP.get(current_aircraft_variant)
-            if not base_simobject_pmdg_folder_name: raise ValueError(f"PMDG base folder name not found for variant: {current_aircraft_variant}") # English
+            base_simobject_pmdg_folder_name = VARIANT_BASE_AIRCRAFT_MAP.get(selected_variant_for_install)
+            if not base_simobject_pmdg_folder_name:
+                raise ValueError(f"PMDG base SimObject folder name missing for variant: {selected_variant_for_install}")
 
             common_install_config = {
                 'reference_livery_path': reference_livery_path,
-                'pmdg_localstate_package_path': pmdg_localstate_for_variant,
-                'aircraft_variant': current_aircraft_variant,
-                'main_package_folder': target_package_root_path,
-                'base_aircraft_folder_name': base_simobject_pmdg_folder_name,
+                'pmdg_localstate_package_path': pmdg_localstate_for_variant_base_pkg,
+                'aircraft_variant': selected_variant_for_install,
+                'main_package_folder': target_community_package_root_path, # e.g., .../Community/pmdg-aircraft-737-liveries
+                'base_aircraft_folder_name': base_simobject_pmdg_folder_name, # e.g., PMDG 737-700
             }
 
-            target_package_root_path.mkdir(parents=True, exist_ok=True)
-            manifest_path_in_package = target_package_root_path / "manifest.json"
-            layout_path_in_package = target_package_root_path / "layout.json"
+            target_community_package_root_path.mkdir(parents=True, exist_ok=True)
+            manifest_path_in_package = target_community_package_root_path / "manifest.json"
+            layout_path_in_package = target_community_package_root_path / "layout.json"
 
             if not manifest_path_in_package.exists():
                 ref_manifest_path = reference_livery_path / "manifest.json"
                 if not ref_manifest_path.is_file():
-                    raise FileNotFoundError(f"Reference manifest.json not found at '{reference_livery_path}' and no destination manifest exists.") # English
-                self.log(f"Copying manifest.json from reference to '{manifest_path_in_package}'", "INFO") # English
+                    raise FileNotFoundError(f"Reference manifest.json missing at '{reference_livery_path}' and no destination manifest exists for '{target_community_package_name}'.")
                 shutil.copy2(ref_manifest_path, manifest_path_in_package)
+                self.log(f"Copied manifest.json from reference to '{manifest_path_in_package}'", "INFO")
             
             try:
-                dep_name = VARIANT_DEPENDENCY_MAP.get(current_aircraft_variant)
-                dep_list = [{"name": dep_name}] if dep_name else []
-                if not dep_name: self.log(f"Could not determine dependency for variant '{current_aircraft_variant}'.", "ERROR") # English
-                else: self.log(f"Ensuring dependency '{dep_name}' in '{manifest_path_in_package.name}'.", "INFO") # English
+                dependency_name_for_manifest = VARIANT_DEPENDENCY_MAP.get(selected_variant_for_install)
+                if not dependency_name_for_manifest:
+                    self.log(f"Dependency mapping missing for '{selected_variant_for_install}'. Manifest may be incomplete.", "ERROR")
+                    dep_list = []
+                else:
+                    dep_list = [{"name": dependency_name_for_manifest, "package_version": "0.1.0"}] # Example version
 
-                m_data = {}
-                if manifest_path_in_package.is_file():
-                    with open(manifest_path_in_package, 'r', encoding='utf-8') as f: m_data = json.load(f)
-                
-                m_data.update({
-                    "dependencies": dep_list, "content_type": "LIVERY",
-                    "title": f"Livery Pack: PMDG {current_aircraft_variant}", "manufacturer": m_data.get("manufacturer", "PMDG"),
-                    "creator": f"Community / {self.app_version}", "package_version": m_data.get("package_version", "1.0.0"),
-                    "minimum_game_version": DEFAULT_MIN_GAME_VERSION,
-                    "total_package_size": m_data.get("total_package_size", "0"*20),
-                })
-                if "release_notes" not in m_data: m_data["release_notes"] = {"neutral": {"LastUpdate": "", "OlderHistory": ""}}
-                with open(manifest_path_in_package, 'w', encoding='utf-8', newline='\n') as f: json.dump(m_data, f, indent=4)
-                self.log("Manifest.json (dependency and metadata) verified/updated.", "SUCCESS") # English
+                with open(manifest_path_in_package, 'r+', encoding='utf-8') as f:
+                    m_data = json.load(f)
+                    m_data.update({
+                        "dependencies": dep_list,
+                        "content_type": "LIVERY",
+                        "title": f"Livery Pack: {base_simobject_pmdg_folder_name.replace('PMDG ', '')}", # Cleaner title
+                        "manufacturer": m_data.get("manufacturer", "PMDG"), # Preserve if exists
+                        "creator": f"Livery Installer {self.app_version}",
+                        "package_version": m_data.get("package_version", "1.0.0"), # Preserve if exists
+                        "minimum_game_version": DEFAULT_MIN_GAME_VERSION,
+                    })
+                    f.seek(0)
+                    json.dump(m_data, f, indent=4)
+                    f.truncate()
+                self.log(f"Manifest.json for '{target_community_package_name}' updated/initialized.", "SUCCESS")
             except Exception as e_mf_init:
-                self.log(f"ERROR updating initial manifest.json metadata: {e_mf_init}", "ERROR") # English
+                self.log(f"ERROR updating manifest.json for '{target_community_package_name}': {e_mf_init}", "ERROR")
+                # Decide if this is critical enough to stop; for now, it logs and continues
 
-            if not layout_path_in_package.exists():
-                ref_layout_path = reference_livery_path / "layout.json"
-                if ref_layout_path.is_file():
-                    self.log(f"Copying layout.json template from reference to '{layout_path_in_package}'", "INFO") # English
-                    shutil.copy2(ref_layout_path, layout_path_in_package)
-        
+            if not layout_path_in_package.exists() and (reference_livery_path / "layout.json").is_file():
+                shutil.copy2(reference_livery_path / "layout.json", layout_path_in_package)
+                self.log(f"Copied layout.json from reference to '{layout_path_in_package}'", "INFO")
+
         except Exception as config_err:
-            self.log(f"CRITICAL ERROR during initial installation setup: {config_err}", "ERROR") # English
+            self.log(f"CRITICAL SETUP ERROR: {config_err}", "ERROR")
             import traceback
             self.log(f"Traceback: {traceback.format_exc()}", "DETAIL")
-            self.master.after(0, lambda: self.status_var.set("Installation failed! (Configuration Error)")) # English
+            self.master.after(0, lambda: self.status_var.set("Installation failed! (Setup Error)"))
             self.master.after(0, lambda: self.install_button.config(state=tk.NORMAL))
-            messagebox.showerror("Critical Error", f"Could not configure installation:\n{config_err}") # English
+            messagebox.showerror("Critical Error", f"Could not configure installation environment:\n{config_err}")
             return
 
+        # --- Main loop to process each selected archive file ---
         for idx, archive_file_path_str in enumerate(archive_paths_to_process):
             original_archive_path = Path(archive_file_path_str)
             log_archive_name = original_archive_path.name
-            self.log(f"--- Starting processing for: {log_archive_name} ({idx + 1}/{num_files_initial}) ---", "STEP") # English
-            self.master.after(0, lambda i=idx, n=log_archive_name: self.status_var.set(f"Processing {i + 1}/{num_files_initial}: {n}...")) # English
+            self.log(f"--- Processing Archive: {log_archive_name} ({idx + 1}/{num_files_initial}) ---", "STEP")
+            self.master.after(0, lambda i=idx, n=log_archive_name: self.status_var.set(f"Processing {i+1}/{num_files_initial}: {n}..."))
 
-            top_level_temp_dirs_for_this_archive: list[Path] = []
-            archive_had_at_least_one_success_sub_livery = False 
-            archive_had_at_least_one_failure_sub_livery = False
+            # Temporary base directory for this specific archive's processing
+            # Placed inside the target community package to handle long paths better if Community is on a drive with long paths enabled.
+            archive_temp_base = target_community_package_root_path / f"__temp_archive_{original_archive_path.stem}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            
+            current_top_level_archive_had_failure = [False] # Mutable flag to track if any sub-process for this archive fails
 
-            try:
+            try: # This try block is for the processing of a single top-level archive
+                archive_temp_base.mkdir(parents=True, exist_ok=True)
+
                 if original_archive_path.suffix.lower() == ".ptp":
-                    ptp_processing_temp_base = target_package_root_path / f"__temp_ptp_proc_{original_archive_path.stem}_{datetime.now().strftime('%f')}"
-                    ptp_processing_temp_base.mkdir(parents=True, exist_ok=True)
-                    top_level_temp_dirs_for_this_archive.append(ptp_processing_temp_base)
-
-                    conversion_ok, ptp_reorganized_folder = self._run_ptp_converter(original_archive_path, ptp_processing_temp_base)
-                    if not conversion_ok or not ptp_reorganized_folder:
-                        raise RuntimeError(f"PTP conversion failed for {log_archive_name}.") # English
+                    conv_ok, initial_extract_folder, ptp_conv_err_msg = self._run_ptp_converter(original_archive_path, archive_temp_base)
+                    if not conv_ok:
+                        error_detail = ptp_conv_err_msg if ptp_conv_err_msg else f"Initial PTP conversion failed for {log_archive_name}."
+                        raise RuntimeError(error_detail)
                     
-                    reorg_ok, reorg_msg = self._reorganize_ptp_output(ptp_reorganized_folder)
-                    if not reorg_ok:
-                        raise RuntimeError(f"PTP reorganization failed for {log_archive_name}: {reorg_msg}") # English
-                    
-                    livery_ok, detail = self._process_single_livery(ptp_reorganized_folder, original_archive_path, common_install_config)
-                    results_summary.append({"file": log_archive_name, "success": livery_ok, "detail": detail})
-                    if livery_ok: archive_had_at_least_one_success_sub_livery = True
-                    else: archive_had_at_least_one_failure_sub_livery = True
+                    # initial_extract_folder is where _run_ptp_converter has staged the PTP's content
+                    self._process_extracted_ptp_content(
+                        initial_extract_folder,
+                        original_archive_path, # Pass the original top-level PTP path for context
+                        common_install_config,
+                        results_summary,
+                        successful_liveries_installed_count_ref,
+                        current_top_level_archive_had_failure # This flag will be set if any sub-livery fails
+                    )
                 
                 elif original_archive_path.suffix.lower() == ".zip":
-                    zip_extract_base_temp_dir = target_package_root_path / f"__temp_zip_extract_{log_archive_name}_{datetime.now().strftime('%f')}"
-                    zip_extract_base_temp_dir.mkdir(parents=True, exist_ok=True)
-                    top_level_temp_dirs_for_this_archive.append(zip_extract_base_temp_dir)
-                    self._extract_archive(original_archive_path, zip_extract_base_temp_dir)
+                    zip_extract_target_dir = archive_temp_base / f"__extracted_zip_{original_archive_path.stem}"
+                    zip_extract_target_dir.mkdir(parents=True, exist_ok=True)
+                    self._extract_archive(original_archive_path, zip_extract_target_dir)
 
-                    items_in_zip_extract = list(zip_extract_base_temp_dir.iterdir())
-                    effective_content_dir_for_zip = zip_extract_base_temp_dir
+                    # Determine the effective content directory (handles ZIPs with a single root folder)
+                    items_in_zip_extract = list(zip_extract_target_dir.iterdir())
+                    effective_content_dir_for_zip = zip_extract_target_dir
                     if len(items_in_zip_extract) == 1 and items_in_zip_extract[0].is_dir() and \
-                       not items_in_zip_extract[0].name.startswith(('.', '__MACOSX')):
+                       not items_in_zip_extract[0].name.startswith(('.', '__MACOSX', '__temp_')):
                         effective_content_dir_for_zip = items_in_zip_extract[0]
 
                     if self._is_nested_archive(effective_content_dir_for_zip):
+                        self.log(f"'{log_archive_name}' is a ZIP pack. Processing nested archives...", "INFO")
                         nested_archives = list(effective_content_dir_for_zip.glob('*.zip')) + \
                                           list(effective_content_dir_for_zip.glob('*.ptp'))
                         if not nested_archives:
-                            self.log(f"'{log_archive_name}' detected as nested but no .zip or .ptp files found inside. Attempting to process as single livery.", "WARNING") # English
-                            livery_ok, detail = self._process_single_livery(effective_content_dir_for_zip, original_archive_path, common_install_config)
-                            results_summary.append({"file": log_archive_name, "success": livery_ok, "detail": detail})
-                            if livery_ok: archive_had_at_least_one_success_sub_livery = True
-                            else: archive_had_at_least_one_failure_sub_livery = True
+                            self.log(f"Pack '{log_archive_name}' contains no processable sub-archives.", "WARNING")
+                            results_summary.append({"file": log_archive_name, "success": False, "detail": "ZIP Pack empty or no recognized sub-archives."})
+                            current_top_level_archive_had_failure[0] = True
                         else:
-                            self.log(f"'{log_archive_name}' contains {len(nested_archives)} nested archive(s). Processing individually...", "INFO") # English
-                            all_nested_current_pack_ok = True
-                            for nested_idx, nested_path in enumerate(nested_archives):
-                                nested_log_name = nested_path.name
-                                self.log(f"--- Processing nested {nested_idx + 1}/{len(nested_archives)}: {nested_log_name} (from {log_archive_name}) ---", "STEP") # English
+                            for nested_idx, nested_archive_path_obj in enumerate(nested_archives):
+                                nested_log_name_display = f"{log_archive_name} -> {nested_archive_path_obj.name}"
+                                self.log(f"--- Nested {nested_idx + 1}/{len(nested_archives)}: {nested_archive_path_obj.name} ---", "STEP")
                                 
-                                nested_processing_base = zip_extract_base_temp_dir / f"__nested_proc_{nested_path.stem}_{datetime.now().strftime('%f')}"
-                                nested_source_folder: Path | None = None # Renamed for clarity
+                                # Create a unique temp subdir for this nested archive's processing
+                                nested_temp_sub_proc_dir = archive_temp_base / f"__zip_nested_proc_{nested_archive_path_obj.stem}_{nested_idx}_{datetime.now().strftime('%f')}"
                                 try:
-                                    nested_processing_base.mkdir(parents=True, exist_ok=True)
-                                    if nested_path.suffix.lower() == ".ptp":
-                                        conv_ok, conv_folder = self._run_ptp_converter(nested_path, nested_processing_base)
-                                        if not conv_ok or not conv_folder: raise RuntimeError(f"Nested PTP conversion failed: {nested_log_name}") # English
-                                        re_ok, re_detail = self._reorganize_ptp_output(conv_folder)
-                                        if not re_ok: raise RuntimeError(f"Nested PTP reorganization failed for '{nested_log_name}': {re_detail}") # English
-                                        nested_source_folder = conv_folder
-                                    elif nested_path.suffix.lower() == ".zip":
-                                        nested_zip_extract_target = nested_processing_base / f"__extracted_nested_zip_{nested_path.stem}"
-                                        nested_zip_extract_target.mkdir(exist_ok=True)
-                                        self._extract_archive(nested_path, nested_zip_extract_target)
+                                    nested_temp_sub_proc_dir.mkdir(parents=True, exist_ok=True)
+                                    
+                                    if nested_archive_path_obj.suffix.lower() == ".ptp":
+                                        # Handle PTP nested within a ZIP
+                                        s_conv_ok, s_conv_folder, s_ptp_err = self._run_ptp_converter(nested_archive_path_obj, nested_temp_sub_proc_dir)
+                                        if not s_conv_ok:
+                                            s_err_detail = s_ptp_err if s_ptp_err else f"PTP conversion failed for nested {nested_archive_path_obj.name}"
+                                            raise RuntimeError(s_err_detail)
                                         
-                                        items_in_n_extract = list(nested_zip_extract_target.iterdir())
-                                        nested_source_folder = nested_zip_extract_target
-                                        if len(items_in_n_extract) == 1 and items_in_n_extract[0].is_dir() and not items_in_n_extract[0].name.startswith(('.', '__MACOSX')):
-                                            nested_source_folder = items_in_n_extract[0]
-                                    else: 
-                                        self.log(f"Unsupported nested file type: {nested_log_name}", "WARNING"); continue # English
-
-                                    if nested_source_folder:
-                                        liv_ok, det = self._process_single_livery(nested_source_folder, nested_path, common_install_config)
-                                        results_summary.append({"file": f"{log_archive_name} -> {nested_log_name}", "success": liv_ok, "detail": det})
-                                        if not liv_ok: all_nested_current_pack_ok = False
-                                        else: archive_had_at_least_one_success_sub_livery = True # Mark that parent had some success
-                                    else:
-                                        results_summary.append({"file": f"{log_archive_name} -> {nested_log_name}", "success": False, "detail": "Could not determine nested source folder."}) # English
-                                        all_nested_current_pack_ok = False
+                                        self._process_extracted_ptp_content(
+                                            s_conv_folder,
+                                            nested_archive_path_obj, # Pass the path of the nested PTP itself
+                                            common_install_config,
+                                            results_summary,
+                                            successful_liveries_installed_count_ref,
+                                            current_top_level_archive_had_failure # If any sub-PTP fails, it flags the main archive
+                                        )
+                                    elif nested_archive_path_obj.suffix.lower() == ".zip":
+                                        # Handle ZIP nested within a ZIP (assuming it's a single livery)
+                                        nested_zip_extract_target = nested_temp_sub_proc_dir / f"__extracted_sub_zip_{nested_archive_path_obj.stem}"
+                                        nested_zip_extract_target.mkdir(exist_ok=True)
+                                        self._extract_archive(nested_archive_path_obj, nested_zip_extract_target)
+                                        
+                                        items_in_sub_extract = list(nested_zip_extract_target.iterdir())
+                                        prepared_sub_archive_folder = nested_zip_extract_target
+                                        if len(items_in_sub_extract) == 1 and items_in_sub_extract[0].is_dir() and not items_in_sub_extract[0].name.startswith(('.', '__MACOSX')):
+                                            prepared_sub_archive_folder = items_in_sub_extract[0]
+                                        
+                                        if prepared_sub_archive_folder:
+                                            # For nested ZIPs, specific_livery_name is None; _process_single_livery will auto-detect.
+                                            liv_ok, det = self._process_single_livery(prepared_sub_archive_folder, nested_archive_path_obj, common_install_config)
+                                            results_summary.append({"file": nested_log_name_display, "success": liv_ok, "detail": det})
+                                            if liv_ok:
+                                                successful_liveries_installed_count_ref[0] += 1
+                                            else:
+                                                current_top_level_archive_had_failure[0] = True
+                                        else:
+                                            raise RuntimeError(f"Could not prepare content from nested ZIP: {nested_archive_path_obj.name}")
                                 except Exception as e_nest_proc:
-                                    results_summary.append({"file": f"{log_archive_name} -> {nested_log_name}", "success": False, "detail": str(e_nest_proc)})
-                                    all_nested_current_pack_ok = False
-                                finally:
-                                    if nested_processing_base.exists(): shutil.rmtree(nested_processing_base)
-                            
-                            if not all_nested_current_pack_ok : archive_had_at_least_one_failure_sub_livery = True
-
-                    else: # Not a nested ZIP
-                        self.log(f"Processing '{log_archive_name}' as a single ZIP livery.", "INFO") # English
+                                    self.log(f"ERROR processing nested archive '{nested_archive_path_obj.name}': {e_nest_proc}", "ERROR")
+                                    results_summary.append({"file": nested_log_name_display, "success": False, "detail": str(e_nest_proc)})
+                                    current_top_level_archive_had_failure[0] = True
+                                # No explicit cleanup of nested_temp_sub_proc_dir here, as it's inside archive_temp_base
+                    else: # Simple (non-nested) ZIP
+                        # For a top-level simple ZIP, specific_livery_name is None.
                         livery_ok, detail = self._process_single_livery(effective_content_dir_for_zip, original_archive_path, common_install_config)
                         results_summary.append({"file": log_archive_name, "success": livery_ok, "detail": detail})
-                        if livery_ok: archive_had_at_least_one_success_sub_livery = True
-                        else: archive_had_at_least_one_failure_sub_livery = True
+                        if livery_ok:
+                            successful_liveries_installed_count_ref[0] += 1
+                        else:
+                            current_top_level_archive_had_failure[0] = True
                 else:
-                    raise ValueError(f"Unrecognized file type: {log_archive_name}") # English
-                
-                # Update overall batch success/fail counts based on this main archive's outcome
-                if archive_had_at_least_one_failure_sub_livery: # If any part of this archive (or its children) failed
-                    failed_liveries_or_archives += 1
-                elif archive_had_at_least_one_success_sub_livery: # If all parts of this archive (and its children) were successful
-                    successful_liveries_installed += 1
-                # If archive_had_at_least_one_success_sub_livery is False AND archive_had_at_least_one_failure_sub_livery is False
-                # it means it was an empty pack or something unprocessable that didn't explicitly error but also didn't yield success.
-                # In this case, we can count it as a failure for the main archive.
-                elif not archive_had_at_least_one_success_sub_livery and not archive_had_at_least_one_failure_sub_livery:
-                     if original_archive_path.suffix.lower() == ".zip" and self._is_nested_archive(effective_content_dir_for_zip):
-                        self.log(f"Archive '{log_archive_name}' considered failed as it was a pack with no successful liveries.", "WARNING")
-                        failed_liveries_or_archives +=1
+                    raise ValueError(f"Unsupported archive type: {log_archive_name}")
 
-                total_archives_processed += 1
-            
-            except Exception as e_outer_loop_proc:
-                self.log(f"CRITICAL error processing input file '{log_archive_name}': {e_outer_loop_proc}", "ERROR") # English
+            except Exception as e_archive_proc:
+                self.log(f"ERROR processing archive '{log_archive_name}': {e_archive_proc}", "ERROR")
                 import traceback
-                self.log(f"Input file processing traceback: {traceback.format_exc()}", "DETAIL") # English
-                results_summary.append({"file": log_archive_name, "success": False, "detail": str(e_outer_loop_proc)})
-                failed_liveries_or_archives += 1
-                total_archives_processed += 1
+                self.log(f"Traceback for archive processing error: {traceback.format_exc()}", "DETAIL")
+                # Ensure a result is added for the top-level archive if its processing fails early
+                if not any(r["file"] == log_archive_name for r in results_summary): # Avoid duplicate summary for top-level
+                     results_summary.append({"file": log_archive_name, "success": False, "detail": str(e_archive_proc)})
+                current_top_level_archive_had_failure[0] = True
             finally:
-                for temp_dir in top_level_temp_dirs_for_this_archive:
-                    if temp_dir.exists():
-                        try:
-                            shutil.rmtree(temp_dir)
-                            self.log(f"Main processing temp folder '{temp_dir.name}' deleted.", "DETAIL") # English
-                        except Exception as e_clean_main:
-                            self.log(f"Could not delete main processing temp folder '{temp_dir.name}': {e_clean_main}", "WARNING") # English
-            
-            progress_update = ((idx + 1) / num_files_initial) * 85
-            self.master.after(0, lambda p=progress_update: self.progress_var.set(min(p, 85.0)))
-        
-        # (Continuation of install_livery_logic, after the main processing loop)
-
-        # --- Step 7: Automatic Layout Generation & Manifest Update for the Package ---
-        layout_gen_success = False
-        layout_gen_error_detail = ""
-        manifest_update_success = False # For the final total_package_size update
-        manifest_error_detail = ""
-
-        # Only proceed if ALL archives processed in the current batch were successful
-        if failed_liveries_or_archives == 0 and successful_liveries_installed > 0:
-            self.log(f"--- All {successful_liveries_installed} liveries processed successfully in this batch. " # English
-                     f"Starting layout.json generation / manifest.json update for package: {target_package_root_path.name} ---", "STEP") # English
-            self.master.after(0, lambda: self.status_var.set("Generating layout.json...")) # English
-
-            try:
-                layout_success_bool, layout_err_str, content_total_size, layout_file_size = \
-                    self._generate_layout_file(target_package_root_path)
-            except Exception as e_gen_layout:
-                layout_success_bool = False
-                layout_err_str = f"Critical exception in _generate_layout_file: {e_gen_layout}" # English
-                self.log(layout_err_str, "ERROR")
-                import traceback
-                self.log(f"Traceback _generate_layout_file: {traceback.format_exc()}", "DETAIL")
-
-            if layout_success_bool:
-                layout_gen_success = True
-                self.master.after(0, lambda: self.progress_var.set(95))
-                self.master.after(0, lambda: self.status_var.set("Updating manifest.json...")) # English
-
-                manifest_path_in_pkg = target_package_root_path / "manifest.json"
-                current_manifest_actual_size = 0
-                if manifest_path_in_pkg.is_file():
-                    try: current_manifest_actual_size = manifest_path_in_pkg.stat().st_size
-                    except Exception as e_stat: self.log(f"Warning: Could not get size of existing manifest.json: {e_stat}", "WARNING") # English
-                
-                final_total_package_size_val = content_total_size + layout_file_size + current_manifest_actual_size
-                
-                try:
-                    manifest_size_update_ok = self._update_manifest_file(manifest_path_in_pkg, final_total_package_size_val)
-                except Exception as e_upd_manifest:
-                    manifest_size_update_ok = False
-                    manifest_error_detail = f"Critical exception in _update_manifest_file: {e_upd_manifest}" # English
-                    self.log(manifest_error_detail, "ERROR")
-                    import traceback
-                    self.log(f"Traceback _update_manifest_file: {traceback.format_exc()}", "DETAIL")
-
-                if manifest_size_update_ok:
-                    manifest_update_success = True
-                    self.master.after(0, lambda: self.progress_var.set(100))
+                # This finally block is for the try block processing a single top-level archive
+                self.log(f"Attempting to clean temp dir for archive '{log_archive_name}': {archive_temp_base}", "DETAIL")
+                if archive_temp_base.exists():
+                    try:
+                        shutil.rmtree(archive_temp_base)
+                        self.log(f"Successfully cleaned temp dir: {archive_temp_base}", "DETAIL")
+                    except Exception as e_clean:
+                        self.log(f"Error cleaning temp dir '{archive_temp_base.name}': {e_clean}", "WARNING")
+                        # Log more details if cleanup fails, as it might indicate locked files
+                        import traceback
+                        self.log(f"Traceback for temp dir cleanup error: {traceback.format_exc()}", "DETAIL")
                 else:
-                    if not manifest_error_detail:
-                        manifest_error_detail = "Failed to update total_package_size in manifest.json. See log." # English
-                    self.log(manifest_error_detail, "ERROR")
-            else:
-                layout_gen_error_detail = f"Failed to generate layout.json: {layout_err_str}. See log." # English
-                self.log(layout_gen_error_detail, "ERROR")
-                self.master.after(0, lambda: self.progress_var.set(min(self.progress_var.get(), 90)))
-        
-        elif successful_liveries_installed > 0 and failed_liveries_or_archives > 0:
-            self.log(f"{successful_liveries_installed} liveries processed successfully, but {failed_liveries_or_archives} archive(s)/livery(s) failed. " # English
-                     f"SKIPPING layout.json and manifest.json update for package '{target_package_root_path.name}' to maintain consistency.", "WARNING") # English
-        elif total_archives_processed > 0 and successful_liveries_installed == 0 :
-            self.log(f"All {total_archives_processed} attempted livery installations failed. " # English
-                     f"layout.json and manifest.json for package '{target_package_root_path.name}' will not be updated.", "ERROR") # English
-        else: # No archives were processed (total_archives_processed == 0)
-             self.log(f"No archives processed. No update required for layout.json or manifest.json for package '{target_package_root_path.name}'.", "INFO") # English
-
-        # --- Final Notification ---
-        post_processing_attempted_this_run = (failed_liveries_or_archives == 0 and successful_liveries_installed > 0)
-        final_layout_manifest_update_success = layout_gen_success and manifest_update_success if post_processing_attempted_this_run else False
-        
-        final_post_proc_error_msg = ""
-        if post_processing_attempted_this_run:
-            if not final_layout_manifest_update_success:
-                final_post_proc_error_msg = layout_gen_error_detail or manifest_error_detail
-        elif failed_liveries_or_archives > 0 :
-             final_post_proc_error_msg = "Layout/Manifest update SKIPPED due to failures in one or more individual liveries." # English
-        
-        if total_archives_processed == 0: final_batch_status_message = "No files processed." # English
-        elif failed_liveries_or_archives == 0 and final_layout_manifest_update_success : final_batch_status_message = "Completed" # English
-        elif successful_liveries_installed > 0: final_batch_status_message = "Completed with errors" # English
-        else: final_batch_status_message = "Failed" # English
+                    self.log(f"Temp dir not found for cleaning (already cleaned or never fully created): {archive_temp_base}", "DETAIL")
             
-        self.master.after(0, lambda msg=final_batch_status_message: self.status_var.set(msg))
-        
-        def finalize_ui_and_reset():
-            self.install_button.config(state=tk.NORMAL)
-            self._reset_install_fields()
-            self.log("Batch installation process finished. Ready for new operation.", "STEP") # English
+            total_archives_processed_count += 1
+            if current_top_level_archive_had_failure[0]:
+                failed_top_level_archives_count += 1
+            
+            progress = ((idx + 1) / num_files_initial) * 85.0 # 85% for processing, 15% for layout/manifest
+            self.master.after(0, lambda p=progress: self.progress_var.set(p))
+        # --- End of loop for processing each selected archive file ---
 
-        self.master.after(100, lambda: self.show_multi_final_message(
-            results_summary, 
-            final_layout_manifest_update_success,
-            final_post_proc_error_msg, 
-            str(target_package_root_path) # Ensure it's a string for the message
-            )
-        )
-        self.master.after(300, finalize_ui_and_reset)
+        final_successful_liveries = successful_liveries_installed_count_ref[0]
+        layout_manifest_ok = False
+        final_post_proc_msg = ""
+
+        if final_successful_liveries > 0 and failed_top_level_archives_count == 0:
+            self.log(f"All {final_successful_liveries} livery(s) from {total_archives_processed_count} archive(s) appear to have installed correctly. Generating layout/manifest...", "STEP")
+            try:
+                layout_ok, layout_err, content_total_size, layout_file_size = self._generate_layout_file(target_community_package_root_path)
+                if layout_ok:
+                    self.master.after(0, lambda: self.progress_var.set(95))
+                    self.master.after(0, lambda: self.status_var.set("Updating manifest.json..."))
+                    
+                    manifest_actual_size = 0
+                    if manifest_path_in_package.is_file():
+                        manifest_actual_size = manifest_path_in_package.stat().st_size
+                    
+                    total_package_size_for_manifest = content_total_size + layout_file_size + manifest_actual_size
+                    
+                    manifest_ok = self._update_manifest_file(manifest_path_in_package, total_package_size_for_manifest)
+                    if manifest_ok:
+                        layout_manifest_ok = True
+                        self.master.after(0, lambda: self.progress_var.set(100))
+                        final_post_proc_msg = "Layout.json and manifest.json generated/updated successfully."
+                        self.log(final_post_proc_msg, "SUCCESS")
+                    else:
+                        final_post_proc_msg = "Failed to update manifest.json total_package_size."
+                        self.log(final_post_proc_msg, "ERROR")
+                else:
+                    final_post_proc_msg = f"Failed to generate layout.json: {layout_err}"
+                    self.log(final_post_proc_msg, "ERROR")
+            except Exception as e_post_proc:
+                final_post_proc_msg = f"Error during layout/manifest generation: {e_post_proc}"
+                self.log(final_post_proc_msg, "ERROR")
+                import traceback
+                self.log(f"Traceback for post-processing error: {traceback.format_exc()}", "DETAIL")
+        elif final_successful_liveries > 0: # Some liveries installed, but some top-level archives had errors
+            final_post_proc_msg = (f"Partial success. {failed_top_level_archives_count} of {total_archives_processed_count} top-level archive(s) had errors. "
+                                   "Layout/manifest NOT updated for the package. Installed liveries from successful archives might work, "
+                                   "but the overall package state is inconsistent.")
+            self.log(final_post_proc_msg, "WARNING")
+            self.master.after(0, lambda: self.progress_var.set(100)) # Mark progress as done, but with issues
+        elif total_archives_processed_count > 0: # All top-level archives failed or yielded no liveries
+            final_post_proc_msg = "All installations failed or archives yielded no liveries. Layout/manifest NOT updated."
+            self.log(final_post_proc_msg, "ERROR")
+            self.master.after(0, lambda: self.progress_var.set(100))
+        else: # No files were processed (e.g., user didn't select any)
+            final_post_proc_msg = "No files selected or processed. No updates made."
+            self.log(final_post_proc_msg, "INFO")
+            self.master.after(0, lambda: self.progress_var.set(100))
+
+        # --- Final Status Update and Message ---
+        final_status_message = "No files processed."
+        if total_archives_processed_count > 0:
+            if failed_top_level_archives_count == 0 and layout_manifest_ok:
+                final_status_message = "Completed successfully!"
+            elif final_successful_liveries > 0:
+                final_status_message = "Completed with errors."
+            else:
+                final_status_message = "All operations failed."
+        
+        self.master.after(0, lambda s=final_status_message: self.status_var.set(s))
+        self.master.after(100, lambda: self.show_multi_final_message(results_summary, layout_manifest_ok, final_post_proc_msg, str(target_community_package_root_path)))
+        self.master.after(200, self._finalize_installation_ui)
+
+
+    def _finalize_installation_ui(self):
+        """Resets UI elements after an installation attempt."""
+        self.install_button.config(state=tk.NORMAL)
+        self._reset_install_fields()
+        self.log("Batch installation process finished. Ready for new operation.", "STEP")
 
     def _reset_install_fields(self):
-        self.log("Resetting install tab fields.", "DETAIL") # English
+        self.log("Resetting install tab fields.", "DETAIL")
         self.selected_zip_files = []
         self.livery_zip_display_var.set("")
         self.custom_name_var.set("")
-        if hasattr(self, 'custom_name_entry') and self.custom_name_entry: # Check widget exists
-            self.custom_name_entry.config(state=tk.NORMAL)
-        # self.status_var.set("Ready") # Already handled by finalize_ui_and_reset or similar
+        if hasattr(self, 'custom_name_entry') and self.custom_name_entry.winfo_exists():
+             self.custom_name_entry.config(state=tk.NORMAL)
+        # Optionally, clear aircraft selection or leave for convenience
+        # self.aircraft_series_var.set("")
+        # self.variant_combobox.set("")
+        # self.variant_combobox.config(state='disabled', values=[])
+        # self.aircraft_variant_var.set("")
 
-    def modify_aircraft_cfg(self, cfg_path: Path, aircraft_variant: str, livery_title: str): # livery_title not used currently
+    def modify_aircraft_cfg(self, cfg_path: Path, aircraft_variant_selected: str, livery_title_from_detection: str):
+        """
+        Modifies the aircraft.cfg file at cfg_path.
+        - Ensures [FLTSIM.0] title matches livery_title_from_detection, correcting "ttitle".
+        - Normalizes malformed [fltsim.x] headers (e.g., [[fltsim.0]]).
+        - Ensures [VARIATION] base_container is correct for the aircraft_variant_selected.
+        - Attempts to place a missing [VARIATION] section after [VERSION] or before [FLTSIM.0].
+        - Ensures a [VERSION] section exists, prepending if necessary.
+        """
         if not cfg_path.is_file():
-            raise FileNotFoundError(f"Cannot modify aircraft.cfg, file not found: {cfg_path}") # English
+            raise FileNotFoundError(f"Cannot modify aircraft.cfg, file not found: {cfg_path}")
 
-        correct_base_folder_name = VARIANT_BASE_AIRCRAFT_MAP.get(aircraft_variant)
-        if not correct_base_folder_name:
-            raise ValueError(f"Invalid variant '{aircraft_variant}' for aircraft.cfg.") # English
+        self.log(f"Modifying aircraft.cfg: {cfg_path.name} for variant {aircraft_variant_selected}, title '{livery_title_from_detection}'", "INFO")
+
+        cfg_base_container_name_from_map = AIRCRAFT_CFG_BASE_CONTAINER_MAP.get(aircraft_variant_selected)
+        if not cfg_base_container_name_from_map:
+            raise ValueError(f"Invalid variant '{aircraft_variant_selected}' for aircraft.cfg base_container lookup in AIRCRAFT_CFG_BASE_CONTAINER_MAP.")
 
         try:
-            with open(cfg_path, 'r', encoding='utf-8', errors='ignore', newline='') as f: lines = f.readlines()
-        except Exception as e: raise RuntimeError(f"Error reading aircraft.cfg file '{cfg_path}': {e}") # English
+            with open(cfg_path, 'r', encoding='utf-8', errors='ignore', newline='') as f:
+                lines = f.readlines()
+        except Exception as e:
+            raise RuntimeError(f"Error reading aircraft.cfg file '{cfg_path}': {e}")
 
-        target_variation_base_container_value = f'"..\\{correct_base_folder_name}"'
-        if aircraft_variant == "200ER":
-            self.log("Processing 777-200ER: Checking for engine suffix in original [VARIATION]...", "DETAIL") # English
-            in_variation_s_read = False; original_bc_line = None
-            for line_r in lines:
-                s_line_r = line_r.strip()
-                if s_line_r.lower() == '[variation]': in_variation_s_read = True; continue
-                if in_variation_s_read:
-                    if s_line_r.startswith('['): break 
-                    if re.match(r'^\s*base_container\s*=', s_line_r,re.IGNORECASE): original_bc_line = s_line_r; break
-            if original_bc_line:
-                bc_match = re.match(r'^\s*base_container\s*=\s*"?(.+?)"?\s*$',original_bc_line,re.IGNORECASE)
-                if bc_match:
-                    existing_val = bc_match.group(1).strip().replace('/','\\')
-                    engine_match = re.search(rf'{re.escape(correct_base_folder_name)}\s+(GE|RR|PW)\b',existing_val,re.IGNORECASE)
-                    if eng_match:
-                        target_variation_base_container_value = f'"..\\{correct_base_folder_name} {eng_match.group(1).upper()}"'
-                        self.log(f"Preserved engine suffix '{eng_match.group(1).upper()}' for base_container.", "INFO") # English
+        eol_char = '\n'  # Default EOL
+        if lines and lines[0].endswith('\r\n'):
+            eol_char = '\r\n'
         
-        target_bc_line_content = f'base_container = {target_variation_base_container_value}'
-        self.log(f"Target [VARIATION] base_container line: {target_bc_line_content}", "DETAIL") # English
+        target_variation_base_container_value = f'"..\\{cfg_base_container_name_from_map}"'
+        if aircraft_variant_selected == "777-200ER": # Special handling for 777-200ER engine variants
+            original_bc_line_content = None
+            temp_in_variation_check = False
+            for line_r_check in lines:
+                s_line_r_check = line_r_check.strip()
+                if s_line_r_check.lower() == '[variation]': temp_in_variation_check = True; continue
+                if temp_in_variation_check:
+                    if s_line_r_check.startswith('['): break 
+                    if re.match(r'^\s*base_container\s*=', s_line_r_check, re.IGNORECASE):
+                        original_bc_line_content = s_line_r_check; break
+            if original_bc_line_content:
+                bc_match_check = re.match(r'^\s*base_container\s*=\s*"?(.+?)"?\s*$', original_bc_line_content, re.IGNORECASE)
+                if bc_match_check:
+                    existing_val_check = bc_match_check.group(1).strip().replace('/', '\\')
+                    engine_suffix_match_check = re.search(rf'{re.escape(cfg_base_container_name_from_map)}\s+(GE|RR|PW)\b', existing_val_check, re.IGNORECASE)
+                    if engine_suffix_match_check:
+                        engine_code_check = engine_suffix_match_check.group(1).upper()
+                        target_variation_base_container_value = f'"..\\{cfg_base_container_name_from_map} {engine_code_check}"'
+                        self.log(f"777-200ER: Will use engine suffix '{engine_code_check}' for base_container.", "DETAIL")
         
+        final_target_bc_line_to_write = f'base_container = {target_variation_base_container_value}'
+        final_target_title_line_to_write = f'title = "{livery_title_from_detection}"'
+        self.log(f"Target aircraft.cfg [VARIATION] base_container: {final_target_bc_line_to_write}", "DETAIL")
+        self.log(f"Target aircraft.cfg [FLTSIM.0] title: {final_target_title_line_to_write}", "DETAIL")
+
         output_lines = []
         needs_rewrite = False
-        variation_section_found_cfg = any(line.strip().lower() == '[variation]' for line in lines)
-        base_container_handled_in_section = False
-
-        if not variation_section_found_cfg:
-            self.log("[VARIATION] section not found. Adding it with base_container.", "INFO") # English
-            version_idx = -1
-            for i, line in enumerate(lines):
-                if line.strip().lower() == '[version]': version_idx = i; break
-            
-            line_ending = '\r\n' if lines and (lines[0].endswith('\r\n') or lines[-1].endswith('\r\n')) else '\n'
-            new_variation_lines = [f"{line_ending if version_idx != -1 and lines[version_idx].strip() else ''}[VARIATION]{line_ending}", 
-                                   f"    {target_bc_line_content}{line_ending}"]
-            if version_idx != -1:
-                insert_at = version_idx + 1
-                while insert_at < len(lines) and (not lines[insert_at].strip() or not lines[insert_at].strip().startswith('[')):
-                    insert_at += 1
-                output_lines = lines[:insert_at] + new_variation_lines + [line_ending] + lines[insert_at:]
-            else: output_lines = new_variation_lines + [line_ending] + lines 
-            needs_rewrite = True
-        else:
-            in_variation_now = False
-            for line in lines:
-                s_line = line.strip()
-                indent = line[:len(line)-len(line.lstrip())]
-                current_eol = '\r\n' if line.endswith('\r\n') else '\n'
-
-                if s_line.lower() == '[variation]':
-                    in_variation_now = True; output_lines.append(line); continue
-                
-                if in_variation_now:
-                    if s_line.startswith('['): # Next section
-                        if not base_container_handled_in_section:
-                            pref_indent = "    " # Default indent
-                            if output_lines and output_lines[-1].strip() and not output_lines[-1].strip().startswith('['):
-                                pref_indent = output_lines[-1][:len(output_lines[-1]) - len(output_lines[-1].lstrip())] or pref_indent
-                            output_lines.append(f"{pref_indent}{target_bc_line_content}{current_eol}")
-                            needs_rewrite = True; self.log("Added missing base_container line to existing [VARIATION] section.", "INFO") # English
-                        base_container_handled_in_section = True; in_variation_now = False
-                        output_lines.append(line); continue
-                    
-                    if re.match(r'^\s*base_container\s*=', s_line, re.IGNORECASE):
-                        base_container_handled_in_section = True
-                        if s_line != target_bc_line_content: # Compare exact content for change
-                            output_lines.append(f"{indent}{target_bc_line_content}{current_eol}")
-                            self.log(f"Updated base_container line. Old: '{s_line}', New: '{target_bc_line_content}'", "INFO") # English
-                            needs_rewrite = True
-                        else: output_lines.append(line)
-                        continue
-                output_lines.append(line)
-            
-            if in_variation_now and not base_container_handled_in_section: # EOF reached while still in [VARIATION]
-                pref_indent = "    "
-                if output_lines and output_lines[-1].strip() and not output_lines[-1].strip().startswith('['):
-                     pref_indent = output_lines[-1][:len(output_lines[-1]) - len(output_lines[-1].lstrip())] or pref_indent
-                output_lines.append(f"{pref_indent}{target_bc_line_content}{current_eol if output_lines else '\n'}")
-                needs_rewrite = True; self.log("Added base_container at the end of [VARIATION] section (EOF).", "INFO") # English
         
+        in_fltsim0 = False; title_handled_current_section = False
+        in_variation = False; base_container_handled_current_section = False
+        
+        original_version_exists = any(line.strip().lower() == '[version]' for line in lines)
+        original_variation_exists = any(line.strip().lower() == '[variation]' for line in lines)
+        # Check if a correctly formatted [fltsim.0] exists or can be formed
+        # This flag will be set if we successfully process or normalize an fltsim section to [fltsim.0]
+        fltsim0_processed_or_normalized = False
+
+        idx = 0
+        while idx < len(lines):
+            line_content = lines[idx]
+            stripped = line_content.strip()
+            s_line_lower = stripped.lower()
+            indent = line_content[:-len(stripped)] if stripped else ""
+
+            # Regex to catch [fltsim.x] or [[fltsim.x]]
+            fltsim_header_match = re.match(r'^\s*(\[{1,2})fltsim\.[0-9]+(\]{1,2})', s_line_lower, re.IGNORECASE)
+
+            if s_line_lower == '[version]':
+                if in_fltsim0 and not title_handled_current_section: output_lines.append(f"{indent}{final_target_title_line_to_write}{eol_char}"); needs_rewrite = True
+                if in_variation and not base_container_handled_current_section: output_lines.append(f"{indent}{final_target_bc_line_to_write}{eol_char}"); needs_rewrite = True
+                in_fltsim0 = False; in_variation = False
+                output_lines.append(line_content)
+            elif s_line_lower == '[variation]':
+                if in_fltsim0 and not title_handled_current_section: output_lines.append(f"{indent}{final_target_title_line_to_write}{eol_char}"); needs_rewrite = True
+                in_fltsim0 = False; in_variation = True; base_container_handled_current_section = False
+                output_lines.append(line_content)
+            elif fltsim_header_match:
+                if in_fltsim0 and not title_handled_current_section: output_lines.append(f"{indent}{final_target_title_line_to_write}{eol_char}"); needs_rewrite = True
+                if in_variation and not base_container_handled_current_section: output_lines.append(f"{indent}{final_target_bc_line_to_write}{eol_char}"); needs_rewrite = True
+                
+                normalized_fltsim_header = f"{indent}[fltsim.0]{eol_char}" # Always normalize to single bracket
+                if stripped != "[fltsim.0]": # Check against the clean, single-bracket version
+                    self.log(f"Normalized FLTSIM header from '{stripped}' to '[fltsim.0]'.", "INFO"); needs_rewrite = True
+                output_lines.append(normalized_fltsim_header)
+                in_fltsim0 = True; title_handled_current_section = False; in_variation = False
+                fltsim0_processed_or_normalized = True # Mark that we've handled/created a [fltsim.0]
+            elif stripped.startswith('['): # Other sections
+                if in_fltsim0 and not title_handled_current_section: output_lines.append(f"{indent}{final_target_title_line_to_write}{eol_char}"); needs_rewrite = True
+                if in_variation and not base_container_handled_current_section: output_lines.append(f"{indent}{final_target_bc_line_to_write}{eol_char}"); needs_rewrite = True
+                in_fltsim0 = False; in_variation = False
+                output_lines.append(line_content)
+            elif in_fltsim0:
+                # Check for "title=" or "ttitle="
+                if re.match(r'^\s*t?title\s*=', stripped, re.IGNORECASE):
+                    is_ttitle = stripped.lower().startswith("ttitle")
+                    # If it's "ttitle" or the value is different, rewrite with "title ="
+                    if is_ttitle or stripped != final_target_title_line_to_write:
+                        output_lines.append(f"{indent}{final_target_title_line_to_write}{eol_char}")
+                        log_msg = "Updated 'title='" if not is_ttitle else "Corrected 'ttitle=' to 'title='"
+                        self.log(f"{log_msg} in [FLTSIM.0]. Old: '{stripped}'.", "INFO"); needs_rewrite = True
+                    else: # It's "title=" and matches, so keep original line
+                        output_lines.append(line_content)
+                    title_handled_current_section = True
+                else:
+                    output_lines.append(line_content)
+            elif in_variation:
+                if re.match(r'^\s*base_container\s*=', stripped, re.IGNORECASE):
+                    if stripped != final_target_bc_line_to_write:
+                        output_lines.append(f"{indent}{final_target_bc_line_to_write}{eol_char}")
+                        self.log(f"Updated 'base_container=' in [VARIATION]. Old: '{stripped}'.", "INFO"); needs_rewrite = True
+                    else:
+                        output_lines.append(line_content)
+                    base_container_handled_current_section = True
+                else:
+                    output_lines.append(line_content)
+            else:
+                output_lines.append(line_content)
+            idx += 1
+        
+        if in_fltsim0 and not title_handled_current_section:
+            output_lines.append(f"    {final_target_title_line_to_write}{eol_char}")
+            self.log("Added 'title=' at end of [FLTSIM.0] (EOF).", "INFO"); needs_rewrite = True
+            fltsim0_processed_or_normalized = True # We added a title to an existing fltsim0
+        if in_variation and not base_container_handled_current_section:
+            output_lines.append(f"    {final_target_bc_line_to_write}{eol_char}")
+            self.log("Added 'base_container=' at end of [VARIATION] (EOF).", "INFO"); needs_rewrite = True
+
+        if not original_version_exists:
+            self.log("Prepending missing [VERSION] section.", "INFO")
+            new_version_content = [f"[VERSION]{eol_char}", f"major=1{eol_char}", f"minor=0{eol_char}"]
+            if output_lines and output_lines[0].strip() != "" and output_lines[0] != eol_char : new_version_content.append(eol_char)
+            elif not output_lines: new_version_content.append(eol_char)
+            output_lines = new_version_content + output_lines
+            needs_rewrite = True
+
+        if not original_variation_exists:
+            self.log("Attempting to insert missing [VARIATION] section in preferred order.", "INFO")
+            new_variation_section_lines = [f"[VARIATION]{eol_char}", f"    {final_target_bc_line_to_write}{eol_char}"]
+            inserted = False
+            version_end_idx = -1
+            for i, line_out in enumerate(output_lines):
+                if line_out.strip().lower() == '[version]':
+                    j = i + 1
+                    while j < len(output_lines) and not output_lines[j].strip().startswith('['): j += 1
+                    version_end_idx = j; break
+            if version_end_idx != -1:
+                prefix_lines = [eol_char] if version_end_idx > 0 and output_lines[version_end_idx-1].strip() != "" else []
+                # Ensure a blank line after the variation section if there's content following it
+                suffix_lines = [eol_char] if version_end_idx < len(output_lines) and output_lines[version_end_idx].strip() != "" else []
+                output_lines = output_lines[:version_end_idx] + prefix_lines + new_variation_section_lines + suffix_lines + output_lines[version_end_idx:]
+                self.log("Inserted [VARIATION] section after [VERSION].", "DETAIL"); inserted = True; needs_rewrite = True
+            
+            if not inserted:
+                fltsim0_start_idx = -1
+                for i, line_out in enumerate(output_lines):
+                    if re.match(r'^\s*\[fltsim\.0\]', line_out.strip().lower(), re.IGNORECASE): fltsim0_start_idx = i; break
+                if fltsim0_start_idx != -1:
+                    prefix_lines = [eol_char] if fltsim0_start_idx > 0 and output_lines[fltsim0_start_idx-1].strip() != "" else []
+                    # Ensure a blank line after the variation section
+                    suffix_lines = [eol_char] if output_lines[fltsim0_start_idx].strip() != "" else []
+                    output_lines = output_lines[:fltsim0_start_idx] + prefix_lines + new_variation_section_lines + suffix_lines + output_lines[fltsim0_start_idx:]
+                    self.log("Inserted [VARIATION] section before [FLTSIM.0].", "DETAIL"); inserted = True; needs_rewrite = True
+
+            if not inserted:
+                if output_lines and output_lines[-1].strip() != "": output_lines.append(eol_char)
+                output_lines.extend(new_variation_section_lines)
+                self.log("Appended [VARIATION] section (fallback).", "DETAIL"); needs_rewrite = True
+        
+        # This check is now based on whether we actively processed or normalized a FLTSIM section to [fltsim.0]
+        if not fltsim0_processed_or_normalized:
+            self.log("Adding missing [FLTSIM.0] section as none was found or normalized.", "INFO")
+            if output_lines and output_lines[-1].strip() != "": output_lines.append(eol_char)
+            output_lines.append(f"[FLTSIM.0]{eol_char}")
+            output_lines.append(f"    {final_target_title_line_to_write}{eol_char}")
+            # Consider adding other default essential PMDG fields if this section is brand new
+            # e.g., sim, model, texture - but these are usually derived from the livery itself.
+            needs_rewrite = True
+
+        if not needs_rewrite: # Final check if any line actually changed
+            original_content_for_comparison = "".join(lines)
+            new_content_for_comparison = "".join(output_lines)
+            if original_content_for_comparison != new_content_for_comparison:
+                self.log("Content mismatch detected, marking for rewrite (e.g. EOL normalization).", "DETAIL")
+                needs_rewrite = True
+
         if needs_rewrite:
-            with open(cfg_path, 'w', encoding='utf-8', errors='ignore', newline='') as f_w: f_w.writelines(output_lines)
-            self.log(f"aircraft.cfg '{cfg_path.name}' updated successfully.", "SUCCESS") # English
-        else: self.log(f"No modifications needed for aircraft.cfg '{cfg_path.name}'.", "DETAIL") # English
+            with open(cfg_path, 'w', encoding='utf-8', errors='ignore', newline='') as f_w: # Use newline='' to prevent double EOLs
+                f_w.writelines(output_lines)
+            self.log(f"aircraft.cfg '{cfg_path.name}' saved with modifications.", "SUCCESS")
+        else:
+            self.log(f"No modifications needed for aircraft.cfg '{cfg_path.name}'.", "DETAIL")
+
 
     def _generate_layout_file(self, package_root_path: Path) -> tuple[bool, str, int, int]:
-        self.log(f"Starting _generate_layout_file for: {package_root_path}", "STEP") # English
+        self.log(f"Generating layout.json for: {package_root_path}", "STEP")
         content_entries = []
         files_scanned_count = 0
         content_total_size = 0
-        layout_file_size = 0
-        manifest_size_at_scan_time = 0
+        layout_file_size_on_disk = 0
         layout_json_path = package_root_path / "layout.json"
-        manifest_json_path = package_root_path / "manifest.json"
-        log_interval = 200 
+        excluded_dir_prefixes = ("__temp_",) # Temp folders created by this tool
 
-        self.log(f"Scanning package content at '{package_root_path}'...", "INFO") # English
         try:
-            if manifest_json_path.is_file():
-                try: manifest_size_at_scan_time = manifest_json_path.stat().st_size
-                except OSError as e: self.log(f"Warning: Could not get size of {manifest_json_path.name}: {e}", "WARNING") # English
-
-            for root_str, dirs, files in os.walk(str(package_root_path)):
+            for root_str, dirs, files in os.walk(str(package_root_path), topdown=True):
+                dirs[:] = [d for d in dirs if not d.startswith(excluded_dir_prefixes)]
                 current_root_path = Path(root_str)
-                dirs[:] = [d for d in dirs if not d.startswith("__temp_")] # Exclude own temp folders
                 
-                rel_root = current_root_path.relative_to(package_root_path) if current_root_path != package_root_path else Path(".")
-                self.log(f"  Scanning dir: .\\{rel_root} ({len(files)} files)", "DETAIL") # English
-                
-                for file_idx, filename in enumerate(files):
+                for filename in files:
                     files_scanned_count += 1
-                    if files_scanned_count > 0 and files_scanned_count % log_interval == 0 : # Log progress
-                        self.log(f"    ... {files_scanned_count} files scanned so far...", "DETAIL") # English
+                    if files_scanned_count % 200 == 0:
+                        self.log(f"    ... {files_scanned_count} files scanned for layout...", "DETAIL")
 
                     file_abs_path = current_root_path / filename
                     try:
                         rel_path_str = file_abs_path.relative_to(package_root_path).as_posix()
                         if rel_path_str.lower() in ('layout.json', 'manifest.json') or \
-                           rel_path_str.lower().startswith('_cvt_') or \
                            filename.startswith('.') or filename.lower() == 'thumbs.db':
                             continue
                         
@@ -1656,124 +2287,99 @@ Press Windows Key + R, type `%localappdata%` and press Enter to open the Local f
                             "date": _unix_to_filetime(file_stat.st_mtime)
                         })
                         content_total_size += file_stat.st_size
-                    except FileNotFoundError:
-                        self.log(f"Warning (FileNotFound): '{file_abs_path}' disappeared during scan. Skipping.", "WARNING") # English
                     except Exception as e_file:
-                        self.log(f"Warning: Error processing file '{file_abs_path}' for layout: {e_file}. Skipping.", "WARNING") # English
+                        self.log(f"Warning: Error processing file '{file_abs_path}' for layout: {e_file}. Skipping.", "WARNING")
             
-            self.log(f"Directory scan complete. {len(content_entries)} files to include in layout.json.", "INFO") # English
-            self.log(f"Total content size (excluding layout/manifest): {content_total_size} bytes", "DETAIL") # English
-
+            self.log(f"Layout scan complete. {len(content_entries)} files included. Total content size: {content_total_size} bytes.", "INFO")
             content_entries.sort(key=lambda x: x['path'])
+            
             with open(layout_json_path, 'w', encoding='utf-8', newline='\n') as f_out:
                 json.dump({"content": content_entries}, f_out, indent=4)
-            self.log(f"{layout_json_path.name} generated/updated successfully.", "SUCCESS") # English
-            try: layout_file_size = layout_json_path.stat().st_size
-            except OSError as e: self.log(f"Warning: Could not get size of {layout_json_path.name}: {e}", "WARNING") # English
-            return True, "", content_total_size, layout_file_size
+            self.log(f"{layout_json_path.name} generated/updated successfully.", "SUCCESS")
+            layout_file_size_on_disk = layout_json_path.stat().st_size
+            return True, "", content_total_size, layout_file_size_on_disk
         except Exception as e_main:
-            err_msg = f"CRITICAL error during layout.json generation for '{package_root_path}': {e_main}" # English
-            self.log(err_msg, "ERROR"); import traceback
-            self.log(f"Traceback: {traceback.format_exc()}", "DETAIL")
+            err_msg = f"CRITICAL error during layout.json generation for '{package_root_path}': {e_main}"
+            self.log(err_msg, "ERROR"); import traceback; self.log(f"Traceback: {traceback.format_exc()}", "DETAIL")
             return False, str(e_main), 0, 0
 
-    def _update_manifest_file(self, manifest_path: Path, total_package_size: int) -> bool:
-        self.log(f"Starting _update_manifest_file for: {manifest_path} with total size: {total_package_size}", "STEP") # English
+    def _update_manifest_file(self, manifest_path: Path, calculated_total_package_size: int) -> bool:
+        self.log(f"Updating manifest.json: {manifest_path} with total size: {calculated_total_package_size}", "STEP")
         try:
             if not manifest_path.is_file():
-                self.log(f"Error: {manifest_path.name} not found. Cannot update size.", "ERROR"); return False # English
+                self.log(f"Error: {manifest_path.name} not found. Cannot update size.", "ERROR"); return False
             
-            self.log(f"Reading {manifest_path.name} to update size...", "DETAIL") # English
             with open(manifest_path, 'r+', encoding='utf-8') as f:
                 manifest_data = json.load(f)
                 if not isinstance(manifest_data, dict):
-                    self.log(f"Error: {manifest_path.name} is not valid JSON.", "ERROR"); return False # English
+                    self.log(f"Error: {manifest_path.name} is not valid JSON.", "ERROR"); return False
 
-                new_size_str = f"{total_package_size:020d}"
-                current_size_str = manifest_data.get('total_package_size', '')
-                
-                if current_size_str != new_size_str:
-                    manifest_data['total_package_size'] = new_size_str
-                    self.log(f"'total_package_size' in {manifest_path.name} will be updated.", "INFO") # English
-                    self.log(f"  Old size: {current_size_str}, New size: {new_size_str} ({total_package_size} bytes)", "DETAIL") # English
-                    
-                    f.seek(0)
-                    json.dump(manifest_data, f, indent=4)
-                    f.truncate()
-                    self.log(f"Size changes saved successfully to {manifest_path.name}.", "SUCCESS") # English
-                else:
-                    self.log(f"Info: total_package_size ({current_size_str}) is already correct in {manifest_path.name}. No changes needed.", "DETAIL") # English
+                new_size_str = f"{calculated_total_package_size:020d}" # Padded to 20 digits
+                manifest_data['total_package_size'] = new_size_str
+                # Update release notes last update time
+                if "release_notes" not in manifest_data or not isinstance(manifest_data["release_notes"], dict):
+                    manifest_data["release_notes"] = {"neutral": {}}
+                if "neutral" not in manifest_data["release_notes"] or not isinstance(manifest_data["release_notes"]["neutral"], dict):
+                     manifest_data["release_notes"]["neutral"] = {}
+                manifest_data["release_notes"]["neutral"]["LastUpdate"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+                f.seek(0); json.dump(manifest_data, f, indent=4); f.truncate()
+                self.log(f"'total_package_size' and 'LastUpdate' in {manifest_path.name} updated successfully.", "SUCCESS")
             return True
-        except json.JSONDecodeError as e_json:
-            self.log(f"CRITICAL Error: Could not decode JSON from {manifest_path}: {e_json}", "ERROR") # English
-            return False
-        except IOError as e_io:
-            self.log(f"CRITICAL I/O Error processing {manifest_path}: {e_io}", "ERROR") # English
-            return False
         except Exception as e_gen:
-            self.log(f"CRITICAL unexpected error updating {manifest_path.name}: {e_gen}", "ERROR") # English
-            import traceback
-            self.log(f"Traceback _update_manifest_file: {traceback.format_exc()}", "DETAIL")
+            self.log(f"CRITICAL error updating {manifest_path.name}: {e_gen}", "ERROR")
+            import traceback; self.log(f"Traceback: {traceback.format_exc()}", "DETAIL")
             return False
 
-    def show_multi_final_message(self, results: list[dict], layout_manifest_pkg_success: bool, layout_manifest_pkg_detail: str, install_path_str: str):
-        success_count = sum(1 for r in results if r["success"])
-        fail_count = len(results) - success_count
-        total_processed_archives = len(results)
-        
-        title = "Installation Result" # English
+    def show_multi_final_message(self, results: list[dict], layout_manifest_pkg_postproc_success: bool, layout_manifest_pkg_postproc_detail: str, community_pkg_path_str: str):
+        successful_individual_liveries = sum(1 for r in results if r["success"])
+        failed_individual_liveries_or_archives = len(results) - successful_individual_liveries
+        total_processed_input_archives = len(self.selected_zip_files)
+
+        title = "Installation Batch Result"
         summary_lines = []
-        log_level_for_summary = "INFO"
-        messagebox_type = messagebox.showinfo
+        log_level_for_summary_msg = "INFO"
+        messagebox_func = messagebox.showinfo
 
-        if total_processed_archives == 0:
-            summary_lines.append("No livery archive files were selected or processed.") # English
-        elif fail_count == 0 : 
-            if layout_manifest_pkg_success:
-                summary_lines.append(f"{success_count}/{total_processed_archives} livery(s) installed and package layout/manifest generated successfully!") # English
-                summary_lines.append(f"\nLivery Package: {Path(install_path_str).name}") # English
-                summary_lines.append("\nThe livery/liveries should now be available in MSFS.") # English
-                summary_lines.append("(Restart MSFS if it was running).") # English
-                log_level_for_summary = "SUCCESS"
+        if not results and total_processed_input_archives == 0:
+            summary_lines.append("No livery archive files were selected or no operations were performed.")
+        elif failed_individual_liveries_or_archives == 0 :
+            if layout_manifest_pkg_postproc_success:
+                summary_lines.append(f"All {successful_individual_liveries} livery(s) (from {total_processed_input_archives} archive(s)) installed successfully!")
+                summary_lines.append(f"Package layout.json and manifest.json for '{Path(community_pkg_path_str).name}' also generated/updated.")
+                summary_lines.append("\nThe livery/liveries should now be available in MSFS (restart MSFS if running).")
+                log_level_for_summary_msg = "SUCCESS"
             else: 
-                summary_lines.append(f"{success_count}/{total_processed_archives} livery(s) copied successfully, BUT package layout.json generation or manifest.json update failed!") # English
-                summary_lines.append(f"\nPackage Error: {layout_manifest_pkg_detail}") # English
-                summary_lines.append("\nLiveries might NOT appear in MSFS or the package could be corrupted. Check the log and Help tab.") # English
-                log_level_for_summary = "WARNING"
-                messagebox_type = messagebox.showwarning
+                summary_lines.append(f"All {successful_individual_liveries} livery(s) were copied, BUT package post-processing (layout/manifest) failed!")
+                summary_lines.append(f"\nPackage Finalization Error: {layout_manifest_pkg_postproc_detail}")
+                summary_lines.append("\nLiveries might NOT appear correctly. Check log and Help tab.")
+                log_level_for_summary_msg = "ERROR"; messagebox_func = messagebox.showerror
         else: 
-            summary_lines.append(f"Installation completed with {fail_count} error(s) out of {total_processed_archives} archive(s) processed.") # English
-            summary_lines.append(f" - Successful liveries/archives: {success_count}") # English
-            summary_lines.append(f" - Failed liveries/archives: {fail_count}") # English
+            summary_lines.append(f"Batch completed with {failed_individual_liveries_or_archives} error(s) out of {total_processed_input_archives} archive(s).")
+            summary_lines.append(f" - Successful individual liveries: {successful_individual_liveries}")
+            summary_lines.append(f" - Failed items: {failed_individual_liveries_or_archives}")
             
-            summary_lines.append(f"\nPackage Layout/Manifest Status: {layout_manifest_pkg_detail if layout_manifest_pkg_detail else 'Update not attempted due to prior errors.'}") # English
+            if layout_manifest_pkg_postproc_detail:
+                 summary_lines.append(f"\nPackage Layout/Manifest Status: {layout_manifest_pkg_postproc_detail}")
             
-            summary_lines.append("\nDetails for failed items (check log for more info):") # English
-            errors_shown_count = 0
-            max_errors_to_display_in_box = 3
-            for result_item in results:
-                if not result_item["success"] and errors_shown_count < max_errors_to_display_in_box:
-                    error_text = result_item['detail']
-                    if len(error_text) > 120: error_text = error_text[:117] + "..."
-                    summary_lines.append(f" - {Path(result_item['file']).name}: {error_text}")
-                    errors_shown_count += 1
-            if fail_count > max_errors_to_display_in_box:
-                summary_lines.append(f"    (... and {fail_count - max_errors_to_display_in_box} more errors. Check log.)") # English
-            
-            log_level_for_summary = "ERROR"
-            messagebox_type = messagebox.showerror
+            summary_lines.append("\nDetails for failed items (see log for more):")
+            for i, res_item in enumerate(r for r in results if not r["success"]):
+                if i >= 5: summary_lines.append(f"    (... and {failed_individual_liveries_or_archives - 5} more errors.)"); break
+                err_detail = res_item['detail']; short_err = (err_detail[:120] + '...') if len(err_detail) > 120 else err_detail
+                summary_lines.append(f" - '{Path(res_item['file']).name}': {short_err}")
+            log_level_for_summary_msg = "ERROR"; messagebox_func = messagebox.showerror
 
-        final_summary_message = "\n".join(summary_lines)
-        self.log(f"FINAL SUMMARY: {final_summary_message.replace('\n', ' :: ')}", log_level_for_summary) # Corrected replace
-        
-        messagebox_type(title, final_summary_message)
+        final_summary_msg = "\n".join(summary_lines)
+        self.log(f"FINAL BATCH SUMMARY:\n{final_summary_msg}", log_level_for_summary_msg)
+        messagebox_func(title, final_summary_msg)
 
     def on_close(self):
-        self.log("Saving configuration on exit...", "DETAIL") # English
+        self.log("Saving configuration on exit...", "DETAIL")
         try:
             self.save_config()
         except Exception as e:
-            self.log(f"Error saving configuration during exit: {e}", "WARNING") # English
+            self.log(f"Error saving configuration during exit: {e}", "WARNING")
         finally:
             self.master.destroy()
 
@@ -1785,12 +2391,13 @@ def main():
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
             windll.user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
         except (AttributeError, OSError):
-            try: windll.shcore.SetProcessDpiAwareness(1)
+            try: 
+                PROCESS_PER_MONITOR_DPI_AWARE = 2
+                windll.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
             except (AttributeError, OSError):
                 try: windll.user32.SetProcessDPIAware()
-                except (AttributeError, OSError): print("Warning: Could not set DPI awareness.") # English
-    except ImportError: pass 
-    except Exception as e_dpi: print(f"Error setting DPI awareness: {e_dpi}") # English
+                except: print("WARNING: Could not set DPI awareness.") # Minimal print on final fallback
+    except: pass # Ignore all errors related to DPI awareness setting if ctypes or calls fail
 
     root = tk.Tk()
     app = PMDGLiveryInstaller(root)
