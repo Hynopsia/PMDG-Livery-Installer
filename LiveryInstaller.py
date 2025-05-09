@@ -135,7 +135,7 @@ class PMDGLiveryInstaller:
 
     def __init__(self, master: tk.Tk):
         self.master = master
-        self.app_version = "v2.1.1" # Reflects 737 support and UI improvement
+        self.app_version = "v2.1.2" # Reflects 737 support and UI improvement
         master.title(f"PMDG 737 & 777 Livery Installer {self.app_version}")
         master.geometry("850x750") # Adjusted geometry
         master.minsize(750, 650) # Adjusted min height
