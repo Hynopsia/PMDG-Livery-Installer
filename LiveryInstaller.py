@@ -408,69 +408,75 @@ class PMDGLiveryInstaller:
 
             output_lines = []
             fltsim_section_found = False
-            fallback_entry_to_add = f"fallback.1={relative_fallback_path}"
+            # Ensure the fallback entry uses backslashes as per MSFS convention for these paths
+            fallback_entry_to_add = f"fallback.1={relative_fallback_path.replace('/', '\\')}" 
             
-            # Check if this exact fallback already exists (naively)
-            if any(relative_fallback_path in line for line in lines):
+            # Check if this exact fallback already exists (naively, case-insensitive for value)
+            if any(relative_fallback_path.lower() in line.lower() for line in lines):
                 self.log(f"Fallback to '{relative_fallback_path}' seems to already exist or is similar in {texture_cfg_path}. Skipping addition.", "DETAIL")
                 return
 
             temp_fallbacks = {} # To store existing fallbacks and re-number them
-            new_lines_for_section = []
+            new_lines_for_fltsim_section = [] # Store lines belonging to the current [fltsim] section being processed
             in_fltsim_section_for_processing = False
+            new_fallback_added_to_current_section = False
 
-            for line in lines:
+            for line_idx, line in enumerate(lines):
                 stripped_line = line.strip()
                 s_line_lower = stripped_line.lower()
 
                 if s_line_lower == "[fltsim]":
+                    if in_fltsim_section_for_processing and not new_fallback_added_to_current_section: # Ended a previous fltsim without adding
+                        new_lines_for_fltsim_section.append(fallback_entry_to_add + eol)
+                        for i in sorted(temp_fallbacks.keys()):
+                            new_lines_for_fltsim_section.append(f"fallback.{i + 1}={temp_fallbacks[i]}{eol}")
+                        new_fallback_added_to_current_section = True # Mark as added for this section
+                    output_lines.extend(new_lines_for_fltsim_section) # Add processed previous section
+                    new_lines_for_fltsim_section = [] # Reset for new section
+                    temp_fallbacks.clear()
+
                     fltsim_section_found = True
                     in_fltsim_section_for_processing = True
-                    new_lines_for_section.append(line)
-                    continue
+                    new_lines_for_fltsim_section.append(line) # Add the [fltsim] header itself
+                    new_fallback_added_to_current_section = False # Reset for this new section
                 elif stripped_line.startswith("[") and in_fltsim_section_for_processing:
-                    # End of [fltsim] section
+                    # End of current [fltsim] section because a new section starts
+                    if not new_fallback_added_to_current_section:
+                        new_lines_for_fltsim_section.append(fallback_entry_to_add + eol)
+                        for i in sorted(temp_fallbacks.keys()):
+                            new_lines_for_fltsim_section.append(f"fallback.{i + 1}={temp_fallbacks[i]}{eol}")
+                        new_fallback_added_to_current_section = True
+                    output_lines.extend(new_lines_for_fltsim_section)
+                    new_lines_for_fltsim_section = []
+                    temp_fallbacks.clear()
                     in_fltsim_section_for_processing = False
-                    # Add stored fallbacks before appending the current line (which starts a new section)
-                    # Add the new primary fallback first
-                    new_lines_for_section.append(fallback_entry_to_add + eol)
-                    # Add re-numbered existing fallbacks
-                    for i in sorted(temp_fallbacks.keys()):
-                        new_lines_for_section.append(f"fallback.{i + 1}={temp_fallbacks[i]}{eol}")
-                    temp_fallbacks.clear() # Clear for next potential section (though unlikely for texture.cfg)
-                    output_lines.extend(new_lines_for_section)
-                    new_lines_for_section = []
-                    output_lines.append(line) # Current line starting new section
+                    output_lines.append(line) # Add the new section header
                 elif in_fltsim_section_for_processing:
                     fallback_match = re.match(r"fallback\.([0-9]+)\s*=\s*(.*)", stripped_line, re.IGNORECASE)
                     if fallback_match:
                         idx = int(fallback_match.group(1))
-                        val = fallback_match.group(2)
-                        temp_fallbacks[idx] = val # Store existing fallbacks
-                        # Don't add to new_lines_for_section yet, will be re-added re-numbered
+                        val = fallback_match.group(2).strip() # Ensure no trailing spaces in value
+                        temp_fallbacks[idx] = val 
                     else:
-                        new_lines_for_section.append(line) # Non-fallback line within [fltsim]
+                        new_lines_for_fltsim_section.append(line) 
                 else:
-                    output_lines.append(line) # Line outside any [fltsim] section processing
+                    output_lines.append(line) 
 
-            # If [fltsim] was the last section or file ended within it
+            # After loop, if file ended within [fltsim] section
             if in_fltsim_section_for_processing:
-                new_lines_for_section.append(fallback_entry_to_add + eol)
-                for i in sorted(temp_fallbacks.keys()):
-                    new_lines_for_section.append(f"fallback.{i + 1}={temp_fallbacks[i]}{eol}")
-                output_lines.extend(new_lines_for_section)
+                if not new_fallback_added_to_current_section:
+                    new_lines_for_fltsim_section.append(fallback_entry_to_add + eol)
+                    for i in sorted(temp_fallbacks.keys()):
+                        new_lines_for_fltsim_section.append(f"fallback.{i + 1}={temp_fallbacks[i]}{eol}")
+                output_lines.extend(new_lines_for_fltsim_section)
             
-            if not fltsim_section_found: # If no [fltsim] section at all, create it with the new fallback
-                if output_lines and output_lines[-1].strip() != "": output_lines.append(eol) # Blank line if needed
+            if not fltsim_section_found: 
+                if output_lines and output_lines[-1].strip() != "": output_lines.append(eol)
                 output_lines.append(f"[fltsim]{eol}")
                 output_lines.append(fallback_entry_to_add + eol)
                 self.log(f"Created [fltsim] section and added fallback to {texture_cfg_path}", "INFO")
-            elif not (fallback_entry_to_add + eol in new_lines_for_section or fallback_entry_to_add + eol in output_lines):
-                 # This case should be covered by the logic above, but as a safeguard
-                 self.log(f"Fallback was not added as expected, verify logic. File: {texture_cfg_path}", "WARNING")
-
-
-            with open(texture_cfg_path, 'w', encoding='utf-8', errors='ignore', newline='') as f_w:
+            
+            with open(texture_cfg_path, 'w', encoding='utf-8', errors='ignore', newline='') as f_w: # Use newline='' to preserve EOLs from output_lines
                 f_w.writelines(output_lines)
             self.log(f"Successfully updated texture.cfg: {texture_cfg_path} with fallback to {base_livery_simobjects_folder_name}", "SUCCESS")
 
@@ -478,6 +484,165 @@ class PMDGLiveryInstaller:
             self.log(f"Error modifying texture.cfg at {texture_cfg_path}: {e}", "ERROR")
             import traceback
             self.log(f"Traceback for texture.cfg modification: {traceback.format_exc()}", "DETAIL")
+
+
+    def _process_extracted_ptp_content(self,
+                                       initial_ptp_extract_path: Path, 
+                                       original_top_level_ptp_path: Path,
+                                       common_config: dict,
+                                       results_summary_list: list[dict],
+                                       batch_success_counter: list[int], 
+                                       batch_failure_flag_for_archive: list[bool]
+                                       ) -> None:
+        self.log(f"Examining PTP content from '{original_top_level_ptp_path.name}' in: {initial_ptp_extract_path}", "DETAIL")
+        settings_dat_path = initial_ptp_extract_path / "Settings.dat"
+        is_multi_livery_ptp = False
+        sub_livery_ptp_files_info = [] 
+
+        pack_base_livery_simobjects_folder_name: str | None = None
+        pack_base_livery_texture_folder_name: str | None = None 
+        pack_base_livery_texture_folder_path: Path | None = None
+
+        if settings_dat_path.is_file():
+            self.log(f"Found Settings.dat: {settings_dat_path}", "INFO")
+            parser = configparser.ConfigParser(interpolation=None, strict=False, allow_no_value=True)
+            try:
+                settings_content = settings_dat_path.read_text(encoding='utf-8', errors='ignore')
+                if not settings_content.strip().startswith("["):
+                    self.log("Settings.dat doesn't start with a section, prepending [Settings] for parser.", "DETAIL")
+                    settings_content = "[Settings]\n" + settings_content
+                
+                parser.read_string(settings_content)
+
+                if parser.has_section("Settings") and parser.has_option("Settings", "Type"):
+                    ptp_type = parser.get("Settings", "Type", fallback="").strip().lower()
+                    if ptp_type == "multi livery":
+                        is_multi_livery_ptp = True
+                        count = parser.getint("Settings", "Count", fallback=0)
+                        self.log(f"Detected 'Multi Livery' PTP ('{original_top_level_ptp_path.name}') with {count} sub-liveries.", "INFO")
+                        for i in range(1, count + 1):
+                            section_name = f"Livery {i}"
+                            if parser.has_section(section_name) and parser.has_option(section_name, "Filename"):
+                                filename = parser.get(section_name, "Filename")
+                                name_from_settings = parser.get(section_name, "Name", fallback=filename) 
+                                sub_livery_ptp_files_info.append((filename, name_from_settings))
+                            else:
+                                self.log(f"Warning: Section '{section_name}' missing or 'Filename' option not found in Settings.dat for '{original_top_level_ptp_path.name}'.", "WARNING")
+                                batch_failure_flag_for_archive[0] = True 
+                                if not any(r["file"] == original_top_level_ptp_path.name and "Settings.dat malformed" in r["detail"] for r in results_summary_list):
+                                     results_summary_list.append({ "file": original_top_level_ptp_path.name, "success": False, "detail": f"Settings.dat malformed (section {section_name})."})
+                    else: # Not "multi livery" type
+                        self.log(f"Settings.dat Type is '{ptp_type}' for '{original_top_level_ptp_path.name}', processing as single PTP structure.", "INFO")
+                else: # No [Settings] or Type
+                    self.log(f"Settings.dat for '{original_top_level_ptp_path.name}' does not have [Settings] section or Type option, assuming single PTP structure.", "INFO")
+            except configparser.Error as e_cfg:
+                self.log(f"Error parsing Settings.dat ({settings_dat_path}): {e_cfg}. Assuming single PTP structure for '{original_top_level_ptp_path.name}'.", "WARNING")
+                is_multi_livery_ptp = False # Ensure it's treated as single if parsing fails
+            except Exception as e_set:
+                self.log(f"Unexpected error reading Settings.dat ({settings_dat_path}): {e_set}. Assuming single PTP structure for '{original_top_level_ptp_path.name}'.", "WARNING")
+                is_multi_livery_ptp = False
+
+        if is_multi_livery_ptp and sub_livery_ptp_files_info:
+            self.log(f"Processing {len(sub_livery_ptp_files_info)} sub-liveries from '{original_top_level_ptp_path.name}'.", "INFO")
+            for sub_livery_index, (ptp_filename_in_archive, livery_name_from_settings) in enumerate(sub_livery_ptp_files_info):
+                sub_ptp_file_to_process = initial_ptp_extract_path / ptp_filename_in_archive
+                display_name_for_log_and_summary = f"{original_top_level_ptp_path.name} -> {livery_name_from_settings} ({ptp_filename_in_archive})"
+
+                if not sub_ptp_file_to_process.is_file():
+                    self.log(f"Sub-PTP file '{ptp_filename_in_archive}' not found at '{sub_ptp_file_to_process}'. Skipping.", "ERROR")
+                    results_summary_list.append({"file": display_name_for_log_and_summary, "success": False, "detail": f"Sub-PTP file '{ptp_filename_in_archive}' not found."})
+                    batch_failure_flag_for_archive[0] = True
+                    continue
+
+                self.log(f"--- Processing Sub-PTP: {display_name_for_log_and_summary} ---", "STEP")
+                nested_temp_sub_ptp_processing_dir = initial_ptp_extract_path / f"__sub_ptp_proc_{sub_ptp_file_to_process.stem}_{datetime.now().strftime('%f')}"
+                
+                original_cfg_for_eol_detection: list[str] | None = None
+
+                try:
+                    nested_temp_sub_ptp_processing_dir.mkdir(parents=True, exist_ok=True)
+                    conv_ok_sub, extracted_sub_ptp_content_folder, ptp_conv_err_msg_sub = self._run_ptp_converter(sub_ptp_file_to_process, nested_temp_sub_ptp_processing_dir)
+                    if not conv_ok_sub: raise RuntimeError(ptp_conv_err_msg_sub or f"Conversion failed for sub-PTP: {ptp_filename_in_archive}")
+
+                    src_cfg_path = extracted_sub_ptp_content_folder / "Config.cfg"
+                    if not src_cfg_path.is_file(): src_cfg_path = extracted_sub_ptp_content_folder / "aircraft.cfg"
+                    if src_cfg_path.is_file():
+                        with open(src_cfg_path, 'r', encoding='utf-8', errors='ignore') as f_orig_cfg:
+                            original_cfg_for_eol_detection = f_orig_cfg.readlines()
+
+                    reorg_ok_sub, reorg_msg_sub = self._reorganize_ptp_output(extracted_sub_ptp_content_folder)
+                    if not reorg_ok_sub: raise RuntimeError(f"Reorganization failed for sub-PTP '{ptp_filename_in_archive}': {reorg_msg_sub}")
+                    
+                    # Determine the SimObjects folder name for the current sub-livery BEFORE calling _process_single_livery
+                    temp_sanitized_suffix = re.sub(r'[\\/*?:"<>|]', '_', livery_name_from_settings).strip().replace('.', '_')
+                    if not temp_sanitized_suffix: temp_sanitized_suffix = f"UnnamedSubLivery_{sub_ptp_file_to_process.stem}"
+                    current_sub_livery_simobjects_folder_name = f"{common_config['base_aircraft_folder_name']} {temp_sanitized_suffix}"
+                    current_sub_livery_installed_path = common_config['main_package_folder'] / "SimObjects" / "Airplanes" / current_sub_livery_simobjects_folder_name
+
+                    livery_ok, detail = self._process_single_livery(
+                        extracted_sub_ptp_content_folder,
+                        sub_ptp_file_to_process,
+                        common_config,
+                        specific_livery_name=livery_name_from_settings
+                    )
+
+                    if livery_ok:
+                        batch_success_counter[0] += 1
+                        # Now that _process_single_livery has run and copied files, find the actual texture folder
+                        installed_texture_dirs = self.find_texture_dirs_in_dir(current_sub_livery_installed_path)
+                        current_sub_livery_installed_texture_folder_path: Path | None = None
+                        if installed_texture_dirs:
+                            current_sub_livery_installed_texture_folder_path = Path(installed_texture_dirs[0]) # Assume first one is primary
+                            self.log(f"Found installed texture folder for '{livery_name_from_settings}': {current_sub_livery_installed_texture_folder_path}", "DETAIL")
+                        else:
+                            self.log(f"No 'texture.*' folder found in installed path '{current_sub_livery_installed_path}' for '{livery_name_from_settings}'. Fallback linking might be skipped.", "WARNING")
+                        
+                        if sub_livery_index == 0: 
+                            pack_base_livery_simobjects_folder_name = current_sub_livery_simobjects_folder_name
+                            if current_sub_livery_installed_texture_folder_path and current_sub_livery_installed_texture_folder_path.is_dir():
+                                pack_base_livery_texture_folder_name = current_sub_livery_installed_texture_folder_path.name
+                                pack_base_livery_texture_folder_path = current_sub_livery_installed_texture_folder_path
+                                self.log(f"Set '{pack_base_livery_simobjects_folder_name}\\{pack_base_livery_texture_folder_name}' as potential texture base for this PTP pack.", "DETAIL")
+                        elif pack_base_livery_simobjects_folder_name and pack_base_livery_texture_folder_name and \
+                             current_sub_livery_installed_texture_folder_path and \
+                             current_sub_livery_installed_texture_folder_path.is_dir():
+                            self.log(f"Attempting to add fallback for '{livery_name_from_settings}' to base '{pack_base_livery_simobjects_folder_name}\\{pack_base_livery_texture_folder_name}'.", "INFO")
+                            self._add_texture_fallback_if_needed(
+                                current_sub_livery_installed_texture_folder_path,
+                                pack_base_livery_simobjects_folder_name,
+                                pack_base_livery_texture_folder_name,
+                                original_cfg_for_eol_detection
+                            )
+                        elif pack_base_livery_texture_folder_path: # Base is set, but current sub-livery's texture folder wasn't found
+                            self.log(f"Cannot add texture fallback for '{livery_name_from_settings}': its own texture folder was not found after installation.", "WARNING")
+                        # else: No base livery texture folder was set from the first sub-livery, so can't add fallback.
+
+                    else: # livery_ok is False
+                        batch_failure_flag_for_archive[0] = True
+                    
+                    results_summary_list.append({"file": display_name_for_log_and_summary, "success": livery_ok, "detail": detail})
+
+                except Exception as e_sub_proc:
+                    self.log(f"ERROR processing sub-PTP '{display_name_for_log_and_summary}': {e_sub_proc}", "ERROR")
+                    results_summary_list.append({"file": display_name_for_log_and_summary, "success": False, "detail": str(e_sub_proc)})
+                    batch_failure_flag_for_archive[0] = True
+        
+        else: # Single PTP structure
+            self.log(f"Processing '{original_top_level_ptp_path.name}' as a single PTP structure.", "INFO")
+            try:
+                # No need to get original_cfg_for_eol_detection here as _add_texture_fallback_if_needed is not called for single PTPs
+                reorg_ok, reorg_msg = self._reorganize_ptp_output(initial_ptp_extract_path)
+                if not reorg_ok: raise RuntimeError(f"PTP reorganization failed: {reorg_msg}")
+                
+                livery_ok, detail = self._process_single_livery(initial_ptp_extract_path, original_top_level_ptp_path, common_config, specific_livery_name=None)
+                results_summary_list.append({"file": original_top_level_ptp_path.name, "success": livery_ok, "detail": detail})
+                if livery_ok: batch_success_counter[0] += 1
+                else: batch_failure_flag_for_archive[0] = True
+            except Exception as e_single_ptp_proc:
+                self.log(f"ERROR processing single PTP structure from '{original_top_level_ptp_path.name}': {e_single_ptp_proc}", "ERROR")
+                results_summary_list.append({"file": original_top_level_ptp_path.name, "success": False, "detail": str(e_single_ptp_proc)})
+                batch_failure_flag_for_archive[0] = True
+
 
     def _setup_help_tab(self, parent: ttk.Frame):
         help_canvas = tk.Canvas(parent, highlightthickness=0, background=self.bg_color)
