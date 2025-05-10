@@ -1,6 +1,6 @@
 # PMDG 777 & 737 NG Livery Installer (Unofficial)
 
-**Version:** v2.1.2
+**Version:** v2.1.3
 
 An unofficial, standalone tool to help install third-party liveries in `.zip` or `.ptp` format for the PMDG 777 family (777-200ER, 777-300ER, 777F) AND the PMDG 737 NG family (737-600, -700, -800, -900 series, including variants like BBJ, BCF, BDSF, ER) in Microsoft Flight Simulator (MSFS 2020).
 
